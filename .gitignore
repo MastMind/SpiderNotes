@@ -1,0 +1,30 @@
+# Rust build artifacts (~14 GB)
+target/
+app/src-tauri/target/
+
+# Frontend
+app/node_modules/
+app/dist/
+app/.repro/
+
+# Tauri generated schemas (but the Android project lives in gen/android and IS source)
+app/src-tauri/gen/*
+!app/src-tauri/gen/android/
+app/src-tauri/gen/android/.gradle/
+app/src-tauri/gen/android/build/
+app/src-tauri/gen/android/app/build/
+app/src-tauri/gen/android/local.properties
+
+# Local no-root Linux dev deps
+.sysdeps/
+
+# Android release signing key (kept locally / in GitHub Actions secrets, never committed)
+app/src-tauri/keystore/
+
+# Release artifacts (CI produces them in GitHub Releases)
+dist/
+*.apk
+*.aab
+
+*.local
+.DS_Store

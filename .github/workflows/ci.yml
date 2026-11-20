@@ -1,0 +1,247 @@
+name: ci
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+            bundles: deb,appimage
+            artifacts: |
+              target/release/bundle/deb/*.deb
+              target/release/bundle/appimage/*.AppImage
+          - os: windows-latest
+            name: windows
+            bundles: msi,nsis
+            artifacts: |
+              target/release/bundle/msi/*.msi
+              target/release/bundle/nsis/*.exe
+          - os: macos-latest
+            name: macos
+            bundles: app,dmg
+            # ** covers both target/release/... and target/universal-apple-darwin/release/...
+            artifacts: |
+              target/**/bundle/dmg/*.dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # macOS universal build needs both Apple arches; other OS use the host default
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin x86_64-apple-darwin' || '' }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Linux-only system dependencies for Tauri (webkit2gtk-4.1 and friends)
+      - if: matrix.os == 'ubuntu-latest'
+        run: |
+          # runner's package lists are often stale (404s); wipe and re-download, retry once
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists
+          sudo apt-get update || sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        working-directory: app
+        env:
+          # baked into the frontend as __BUILD_SHA__ (visible in the top bar)
+          CI_SHA: ${{ github.sha }}
+        # macOS: --target universal-apple-darwin => one fat binary (x86_64 + arm64)
+        run: pnpm tauri build --bundles ${{ matrix.bundles }} ${{ matrix.os == 'macos-latest' && '--target universal-apple-darwin' || '' }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spidernotes-${{ matrix.name }}
+          path: ${{ matrix.artifacts }}
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # all four Android ABIs: the universal APK bundles every one of them
+          targets: aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: android-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            android-cargo-
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # space-separated: the action splits on spaces only
+          packages: platforms;android-37.0 build-tools;36.0.0 ndk;29.0.13846066
+
+      # the gradle "rust" plugin (gen/android/buildSrc) shells out to `cargo-tauri`
+      # from PATH; install the prebuilt binary matching @tauri-apps/cli (2.12.5)
+      - name: Install cargo-tauri (prebuilt)
+        run: |
+          curl -sL https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v2.12.5/cargo-tauri-x86_64-unknown-linux-gnu.tgz | tar xz -C "$RUNNER_TEMP"
+          install -m 755 "$RUNNER_TEMP/cargo-tauri" "$HOME/.cargo/bin/cargo-tauri"
+          cargo-tauri --version
+
+      # Decode the release signing key from secrets so the APK is installable.
+      # Requires repo secrets SPIDERNOTES_KEYSTORE_BASE64 + SPIDERNOTES_KEYSTORE_PASSWORD.
+      # If they are missing we do NOT fail the build: we warn and produce an
+      # unsigned APK (still inspectable) so the pipeline stays green.
+      - name: Decode release keystore (signing)
+        env:
+          KEYSTORE_B64: ${{ secrets.SPIDERNOTES_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.SPIDERNOTES_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+            echo "::warning::SPIDERNOTES_KEYSTORE_BASE64 / SPIDERNOTES_KEYSTORE_PASSWORD are not set."
+            echo "==> Building an UNSIGNED APK (may be refused on Android 11+)."
+            echo "To get a signed, installable APK add these two repo secrets"
+            echo "(Settings > Secrets and variables > Actions > New repository secret):"
+            echo "  SPIDERNOTES_KEYSTORE_BASE64   = contents of app/src-tauri/keystore/SPIDERNOTES_KEYSTORE_BASE64.txt"
+            echo "  SPIDERNOTES_KEYSTORE_PASSWORD = the keystore password"
+            exit 0
+          fi
+          # strip ALL whitespace (pasted secrets often carry stray newlines/CR)
+          CLEAN_B64="$(printf '%s' "$KEYSTORE_B64" | tr -d '[:space:]')"
+          echo "keystore base64 length: ${#CLEAN_B64} (expected 3672)"
+          echo "keystore base64 sha256: $(printf '%s' "$CLEAN_B64" | sha256sum | cut -d' ' -f1)"
+          echo "expected sha256:        516e82a268b0a06a06874d5c06655a38cfa466e8659ad4dbff6d8df2caaf249d"
+          mkdir -p app/src-tauri/keystore
+          if ! printf '%s' "$CLEAN_B64" | base64 -d > app/src-tauri/keystore/spidernotes-release.keystore 2>/dev/null; then
+            echo "::error::SPIDERNOTES_KEYSTORE_BASE64 is not valid base64."
+            echo "Re-copy the FULL contents of app/src-tauri/keystore/SPIDERNOTES_KEYSTORE_BASE64.txt"
+            echo "(3672 chars, one line, no line numbers / extra characters) into the secret."
+            exit 1
+          fi
+          if ! keytool -list -keystore app/src-tauri/keystore/spidernotes-release.keystore -storepass "$KEYSTORE_PASSWORD" >/dev/null 2>&1; then
+            echo "::error::Decoded file is not a valid keystore, or SPIDERNOTES_KEYSTORE_PASSWORD is wrong."
+            echo "If the sha256 above differs from the expected one, the secret is truncated/corrupted — re-paste it."
+            exit 1
+          fi
+          ls -l app/src-tauri/keystore/spidernotes-release.keystore
+
+      - name: Build APK (universal, all ABIs)
+        working-directory: app
+        env:
+          # consumed by gen/android/app/build.gradle.kts to sign the release APK
+          SPIDERNOTES_KEYSTORE_PASSWORD: ${{ secrets.SPIDERNOTES_KEYSTORE_PASSWORD }}
+          # baked into the frontend as __BUILD_SHA__ (visible in the top bar)
+          CI_SHA: ${{ github.sha }}
+        # no --target => Tauri builds the "universal" variant (all ABIs in one APK)
+        run: pnpm tauri android build --apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spidernotes-android
+          path: app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+
+  release:
+    needs: [build, android]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # Diagnose the actual layout (artifact entry paths depend on the
+      # upload patterns) and flatten everything into one directory so the
+      # release gets clean asset names. Fails loudly on zero files instead
+      # of publishing an empty release.
+      - name: Stage artifacts for upload
+        run: |
+          echo "=== downloaded artifact layout ==="
+          find artifacts -type f -printf '%p  (%s bytes)\n' | sort
+          mkdir -p upload
+          find artifacts -type f -exec cp -n {} upload/ \;
+          echo "=== files to publish ==="
+          ls -la upload
+          count=$(find upload -type f | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No artifact files found — not publishing an empty release"
+            exit 1
+          fi
+          echo "will publish $count file(s)"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: upload/*
+          draft: false
+          prerelease: true
+          body: |
+            **Alpha release.** Local-first Markdown notes with P2P sync over
+            your home network — no cloud, no server.
+
+            Artifacts:
+            - Linux: `.deb` / `.AppImage`
+            - Windows: `.msi` / Setup `.exe`
+            - macOS: `.dmg` (universal: Intel + Apple Silicon)
+            - Android: universal `.apk` (all ABIs)
+
+            First run: point the app at a vault folder (empty = default
+            path). To sync two devices: open **Network & log** (gear) on each,
+            find the other device, press **Trust**, compare the device IDs,
+            then **Sync with all trusted**.
+
+            This is an alpha — expect rough edges. Back up your vault.

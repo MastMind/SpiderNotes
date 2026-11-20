@@ -1,0 +1,794 @@
+use crate::state::{persist_peers, AppState, MDNS_REFRESH_SECS, PUSH_DEBOUNCE_MS};
+use spidernotes_core::{Note, NoteSummary, Vault};
+use spidernotes_p2p::agent::{sync_initiator, sync_responder, SyncReport as P2pSyncReport};
+use spidernotes_p2p::discovery::{Discovery, PeerEvent, PeerInfo};
+use spidernotes_p2p::transport::SyncListener;
+use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::net::TcpStream;
+use uuid::Uuid;
+
+#[derive(serde::Serialize)]
+pub struct OpenResult {
+    pub path: String,
+    pub p2p_port: u16,
+    pub device_id: String,
+    pub device_name: String,
+    pub notes: Vec<NoteSummary>,
+    pub peers: Vec<PeerInfo>,
+}
+
+#[derive(serde::Serialize)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct P2pSettings {
+    /// Auto-sync ("keep alive") interval in seconds.
+    pub autosync_secs: u64,
+    /// Port the P2P listener is currently bound to (0 if not running).
+    pub p2p_port: u16,
+    /// Desired port, applied on (re)start of P2P.
+    pub p2p_port_setting: u16,
+    pub p2p_running: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct Backlink {
+    pub note: NoteSummary,
+    pub count: usize,
+}
+
+#[derive(serde::Serialize)]
+pub struct TagCount {
+    pub tag: String,
+    pub count: usize,
+}
+
+fn vault_or_err(st: &AppState) -> Result<Vault, String> {
+    st.take_vault().ok_or_else(|| "vault is not open".to_string())
+}
+
+fn expand_tilde(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
+        }
+    }
+    p.to_string()
+}
+
+/// `ip:port` for IPv4, `[ipv6]:port` for IPv6.
+fn parse_peer_addr(addr: &str, port: u16) -> Option<SocketAddr> {
+    let s = if addr.contains(':') {
+        format!("[{addr}]:{port}")
+    } else {
+        format!("{addr}:{port}")
+    };
+    s.parse::<SocketAddr>().ok()
+}
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Hard cap on a full sync exchange. Without it a half-open connection
+/// (peer accepts TCP but never speaks) would hold `sync_gate` forever and
+/// freeze every save/delete/rename behind it.
+const SYNC_PROTOCOL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Update the peer cache and the UI. Only a NON-EMPTY mDNS view replaces the
+/// cache: a freshly (re)created daemon starts empty and would otherwise wipe
+/// the restored (persisted) peers before it re-discovers them. The UI always
+/// gets the real mDNS view through the event, whatever the cache holds.
+fn broadcast_peers(app: &AppHandle, st: &AppState, peers: &[PeerInfo]) {
+    if !peers.is_empty() {
+        *st.peers_cache.lock().unwrap() = peers.to_vec();
+        persist_peers(&st.peers_path, peers);
+    }
+    let _ = app.emit("peers-updated", peers.to_vec());
+}
+
+/// Connect to each *trusted* peer and run the initiator-side sync on the vault.
+/// Untrusted peers are skipped (and logged) so notes never leave for unknown devices.
+/// Caller must hold `st.sync_gate`.
+async fn sync_vault_with_peers(
+    st: &AppState,
+    app: &AppHandle,
+    vault: &mut Vault,
+    peers: &[PeerInfo],
+) -> Vec<P2pSyncReport> {
+    if let Err(e) = vault.scan_and_repair() {
+        tracing::warn!("pre-sync scan: {e}");
+    }
+    let mut out = Vec::new();
+    for p in peers {
+        if !st.trust.is_trusted(&p.device_id) {
+            tracing::debug!("sync: skipping untrusted peer {} ({})", p.name, p.device_id);
+            continue;
+        }
+        let Some(addr) = parse_peer_addr(&p.address, p.port) else {
+            tracing::warn!("sync: bad address for {}: {}", p.name, p.address);
+            continue;
+        };
+        let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                tracing::warn!("sync: cannot reach {}: {e}", p.name);
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!("sync: connect timeout for {} ({addr})", p.name);
+                continue;
+            }
+        };
+        match tokio::time::timeout(
+            SYNC_PROTOCOL_TIMEOUT,
+            sync_initiator(stream, &st.identity, p.x25519_pub, vault),
+        )
+        .await
+        {
+            Ok(Ok(r)) => out.push(r),
+            Ok(Err(e)) => tracing::warn!("sync: {} failed: {e}", p.name),
+            Err(_) => tracing::warn!("sync: {} timed out after {SYNC_PROTOCOL_TIMEOUT:?}", p.name),
+        }
+    }
+    if !out.is_empty() {
+        let _ = app.emit("notes-changed", ());
+    }
+    out
+}
+
+/// Fire-and-forget background sync (auto-sync timer / peer-joined trigger).
+fn spawn_auto_sync(app: AppHandle, st: AppState, peers: Vec<PeerInfo>) {
+    if peers.is_empty() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let _gate = st.sync_gate.lock().await;
+        let Some(mut vault) = st.vault.lock().unwrap().clone() else {
+            return;
+        };
+        let reports = sync_vault_with_peers(&st, &app, &mut vault, &peers).await;
+        for r in &reports {
+            tracing::info!(
+                "auto-sync {}: sent {}, applied {}, skipped {}",
+                r.peer_name,
+                r.sent,
+                r.applied,
+                r.skipped
+            );
+        }
+        st.put_vault(vault);
+    });
+}
+
+/// Debounced push of local edits to all *trusted* peers.
+///
+/// Called after every save/delete/rename. A burst of edits is coalesced into a
+/// single delta-sync per debounce window: the first change spawns a task, later
+/// changes only bump `change_seq`, and the task re-runs if edits arrive while it
+/// is syncing so nothing is dropped.
+fn schedule_push(app: AppHandle, st: AppState) {
+    st.change_seq.fetch_add(1, Ordering::SeqCst);
+    if st.push_pending.swap(true, Ordering::SeqCst) {
+        return; // a push is already pending; it reads the latest vault state
+    }
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(PUSH_DEBOUNCE_MS)).await;
+            // Snapshot the change count *before* cloning the vault: any change
+            // with seq <= `before` is guaranteed to be inside the cloned vault.
+            let before = st.change_seq.load(Ordering::SeqCst);
+            let Some(mut vault) = st.vault.lock().unwrap().clone() else {
+                st.push_pending.store(false, Ordering::SeqCst);
+                return;
+            };
+            let _gate = st.sync_gate.lock().await;
+            let peers = st.peers_cache.lock().unwrap().clone();
+            let reports = sync_vault_with_peers(&st, &app, &mut vault, &peers).await;
+            st.put_vault(vault);
+            drop(_gate);
+            let _ = app.emit("notes-changed", ());
+            for r in &reports {
+                tracing::info!(
+                    "push-sync {}: sent {}, applied {}, skipped {}",
+                    r.peer_name,
+                    r.sent,
+                    r.applied,
+                    r.skipped
+                );
+            }
+            let after = st.change_seq.load(Ordering::SeqCst);
+            st.push_pending.store(false, Ordering::SeqCst);
+            if after == before {
+                break; // nothing changed while we were pushing
+            }
+            // edits landed mid-sync: loop to push them
+            st.push_pending.store(true, Ordering::SeqCst);
+        }
+    });
+}
+
+/// Recreate the mDNS daemon in place (dropping the old one shuts its daemon
+/// down) and keep the previous peer list visible until the fresh daemon
+/// re-confirms the peers (avoids UI flicker).
+fn recreate_discovery(
+    discovery: &mut Discovery,
+    identity: &spidernotes_core::DeviceIdentity,
+    port: u16,
+    peers_cache: &Arc<Mutex<Vec<PeerInfo>>>,
+) {
+    let old = discovery.peers();
+    match Discovery::start(identity, port) {
+        Ok(new_disc) => {
+            *discovery = new_disc;
+            *peers_cache.lock().unwrap() = old;
+        }
+        Err(e) => tracing::warn!("mDNS restart failed: {e}"),
+    }
+}
+
+fn start_p2p(
+    app: AppHandle,
+    st: &AppState,
+    listener: SyncListener,
+    port: u16,
+) -> Result<(), String> {
+    // A single stop handle lets `restart_p2p` tear down all loops of this
+    // P2P generation (accept / discovery / ticker) on demand.
+    let (stop_tx, _initial) = tokio::sync::watch::channel(false);
+    *st.p2p_stop.lock().unwrap() = Some(stop_tx.clone());
+
+    // accept loop
+    let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<TcpStream>(4);
+    let mut stop_accept = stop_tx.subscribe();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = stop_accept.changed() => break,
+                r = listener.accept() => match r {
+                    Ok(stream) => {
+                        if conn_tx.send(stream).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("P2P accept: {e}");
+                        break;
+                    }
+                },
+            }
+        }
+        tracing::info!("P2P accept loop stopped");
+    });
+
+    // responder loop (ends on its own once the accept loop drops `conn_tx`)
+    let identity = st.identity.clone();
+    let vaults_r = st.vault.clone();
+    let gate_r = st.sync_gate.clone();
+    let app_r = app.clone();
+    let trust_r = st.trust.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(stream) = conn_rx.recv().await {
+            // try_lock, never await: if our own initiator holds the gate, the
+            // remote side is (almost certainly) blocked on US waiting for this
+            // responder to answer its initiator — awaiting the same gate here
+            // is a circular wait across devices that freezes every save on
+            // both ends. Rejecting instead breaks the cycle; the peer sees a
+            // clean EOF and retries on its next auto-sync/push round.
+            let Ok(_gate) = gate_r.try_lock() else {
+                tracing::info!("P2P: local sync in progress, rejecting incoming connection");
+                continue;
+            };
+            let Some(mut vault) = vaults_r.lock().unwrap().clone() else {
+                tracing::warn!("P2P connection received, but no vault is open");
+                continue;
+            };
+            if let Err(e) = vault.scan_and_repair() {
+                tracing::warn!("pre-sync scan: {e}");
+            }
+            match tokio::time::timeout(
+                SYNC_PROTOCOL_TIMEOUT,
+                sync_responder(stream, &identity, &mut vault, &trust_r),
+            )
+            .await
+            {
+                Ok(Ok(report)) => {
+                    tracing::info!(
+                        "P2P sync with {}: sent {}, applied {}, skipped {}",
+                        report.peer_name,
+                        report.sent,
+                        report.applied,
+                        report.skipped
+                    );
+                    *vaults_r.lock().unwrap() = Some(vault);
+                    let _ = app_r.emit("notes-changed", ());
+                }
+                Ok(Err(e)) => tracing::warn!("P2P sync failed: {e}"),
+                Err(_) => tracing::warn!("P2P sync: protocol timed out after {SYNC_PROTOCOL_TIMEOUT:?}"),
+            }
+        }
+    });
+
+    // discovery loop
+    let mut discovery = Discovery::start(&st.identity, port)
+        .map_err(|e| format!("mDNS start failed: {e}"))?;
+    let mut stop_disc = stop_tx.subscribe();
+    let mut mdns_req_rx = st.mdns_refresh_tx.subscribe();
+    let peers_cache = st.peers_cache.clone();
+    let app_d = app.clone();
+    let st_d = st.clone();
+    let identity_d = st.identity.clone();
+    tauri::async_runtime::spawn(async move {
+        // STATIC refresh schedule: a fixed N-second period, independent of
+        // the mDNS event flow (mdns-sd's own re-browse delay grows
+        // exponentially 1s,2s,4s,...256s, so an elapsed-time check outside
+        // the select could sleep through its deadline for minutes).
+        let mut refresh_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(MDNS_REFRESH_SECS),
+            Duration::from_secs(MDNS_REFRESH_SECS),
+        );
+        refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        broadcast_peers(&app_d, &st_d, &discovery.peers());
+        loop {
+            tokio::select! {
+                _ = stop_disc.changed() => break,
+                _ = refresh_tick.tick() => {
+                    // Recreate the mDNS daemon on the static schedule: a
+                    // fresh daemon sends a new PTR query (a late peer's
+                    // one-shot announce can be lost on Wi-Fi) and
+                    // re-registers our service with the current IP (A
+                    // records are filled once at registration and go stale
+                    // after a DHCP change).
+                    tracing::info!("mDNS daemon refresh (every {MDNS_REFRESH_SECS}s)");
+                    recreate_discovery(
+                        &mut discovery,
+                        &identity_d,
+                        port,
+                        &peers_cache,
+                    );
+                },
+                _ = mdns_req_rx.changed() => {
+                    // On-demand refresh: the frontend fires this when the
+                    // app returns to the foreground (on Android,
+                    // backgrounding kills the multicast socket, and the
+                    // static 60s tick would otherwise be the only recovery).
+                    tracing::info!("mDNS daemon refresh (on demand)");
+                    recreate_discovery(
+                        &mut discovery,
+                        &identity_d,
+                        port,
+                        &peers_cache,
+                    );
+                },
+                ev = discovery.next_event() => match ev {
+                    Some(PeerEvent::Joined(peer)) => {
+                        broadcast_peers(&app_d, &st_d, &discovery.peers());
+                        spawn_auto_sync(app_d.clone(), st_d.clone(), vec![peer]);
+                    }
+                    Some(PeerEvent::Left(_)) => {
+                        broadcast_peers(&app_d, &st_d, &discovery.peers());
+                    }
+                    None => tokio::time::sleep(Duration::from_millis(200)).await,
+                },
+            }
+        }
+        tracing::info!("P2P discovery loop stopped");
+    });
+
+    // auto-sync ("keep alive") ticker; the interval is read each round so it
+    // can be changed at runtime via `set_autosync_secs`.
+    let mut stop_tick = stop_tx.subscribe();
+    let st_t = st.clone();
+    let app_t = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let secs = st_t.autosync_secs.load(Ordering::SeqCst).max(1);
+            tokio::select! {
+                _ = stop_tick.changed() => break,
+                _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
+            }
+            let peers = st_t.peers_cache.lock().unwrap().clone();
+            spawn_auto_sync(app_t.clone(), st_t.clone(), peers);
+        }
+    });
+    Ok(())
+}
+
+pub async fn do_open_vault(
+    app: AppHandle,
+    path: String,
+    p2p_port: Option<u16>,
+) -> Result<OpenResult, String> {
+    let st = (*app.state::<AppState>()).clone();
+    // Serialize the vault replacement with in-flight syncs (their put-back
+    // would otherwise restore the previous vault over the freshly opened one).
+    let _gate = st.sync_gate.lock().await;
+    let path = expand_tilde(&path);
+    // The port set in advanced settings is the default when the caller does not
+    // pass an explicit one.
+    let want_port = p2p_port.unwrap_or_else(|| st.p2p_port_setting.load(Ordering::SeqCst));
+    let p2p_port = if !st.p2p_running.load(Ordering::SeqCst) {
+        let listener = SyncListener::bind(want_port)
+            .await
+            .map_err(|e| format!("cannot listen on P2P port {want_port}: {e}"))?;
+        let actual = listener.port();
+        start_p2p(app.clone(), &st, listener, actual)?;
+        st.p2p_running.store(true, Ordering::SeqCst);
+        st.p2p_port.store(actual, Ordering::SeqCst);
+        actual
+    } else {
+        st.p2p_port.load(Ordering::SeqCst)
+    };
+
+    let mut vault = Vault::open(&path, st.identity.clone())
+        .map_err(|e| format!("cannot open vault: {e}"))?;
+    if let Err(e) = vault.scan_and_repair() {
+        tracing::warn!("vault scan: {e}");
+    }
+    let notes = vault.live_notes();
+    let root = vault.root().to_string_lossy().to_string();
+    let peers = st.peers_cache.lock().unwrap().clone();
+    st.put_vault(vault);
+    Ok(OpenResult {
+        path: root,
+        p2p_port,
+        device_id: st.identity.id.clone(),
+        device_name: st.identity.name.clone(),
+        notes,
+        peers,
+    })
+}
+
+#[tauri::command]
+pub async fn open_vault(
+    app: AppHandle,
+    path: String,
+    p2p_port: Option<u16>,
+) -> Result<OpenResult, String> {
+    do_open_vault(app, path, p2p_port).await
+}
+
+/// A sensible default vault location: `Documents/SpiderNotes` on desktop,
+/// the app's internal data dir on mobile (always writable, private).
+#[tauri::command]
+pub fn default_vault_path(app: AppHandle) -> String {
+    #[cfg(mobile)]
+    {
+        let base = app
+            .path()
+            .app_data_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        base.join("vault").to_string_lossy().to_string()
+    }
+    #[cfg(not(mobile))]
+    {
+        let _ = &app;
+        let home = dirs::document_dir().or_else(dirs::home_dir).unwrap_or_default();
+        home.join("SpiderNotes").to_string_lossy().to_string()
+    }
+}
+
+/// Current vault state for the frontend (e.g. after `--open <path>`).
+#[tauri::command]
+pub fn vault_status(app: AppHandle) -> Result<Option<OpenResult>, String> {
+    let st = (*app.state::<AppState>()).clone();
+    {
+        let guard = st.vault.lock().unwrap();
+        let Some(v) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let peers = st.peers_cache.lock().unwrap().clone();
+        Ok(Some(OpenResult {
+            path: v.root().to_string_lossy().to_string(),
+            p2p_port: st.p2p_port.load(Ordering::SeqCst),
+            device_id: st.identity.id.clone(),
+            device_name: st.identity.name.clone(),
+            notes: v.live_notes(),
+            peers,
+        }))
+    }
+}
+
+#[tauri::command]
+pub fn list_notes(app: AppHandle) -> Result<Vec<NoteSummary>, String> {
+    let st = (*app.state::<AppState>()).clone();
+    Ok(vault_or_err(&st)?.live_notes())
+}
+
+#[tauri::command]
+pub fn read_note(app: AppHandle, uuid: String) -> Result<Note, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let v = vault_or_err(&st)?;
+    let u: Uuid = uuid.parse::<Uuid>().map_err(|e| e.to_string())?;
+    v.read(&u).map_err(|e| e.to_string())
+}
+
+// Mutations (save/delete/rename) must hold `sync_gate`: an in-flight sync
+// works on a CLONE of the vault and puts it back when done. Without the gate
+// a save landing in that window is silently overwritten by the put-back —
+// the edit's HLC is never bumped, so it is never propagated: permanent
+// desync (hit reliably on Android, where the app is frozen in background).
+
+#[tauri::command]
+pub async fn save_note(
+    app: AppHandle,
+    path: String,
+    content: String,
+) -> Result<NoteSummary, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let _gate = st.sync_gate.lock().await;
+    let mut v = vault_or_err(&st)?;
+    let s = v.write(&path, &content).map_err(|e| e.to_string())?;
+    st.put_vault(v);
+    // clone: `_gate` borrows `st` until end of scope
+    schedule_push(app, st.clone());
+    Ok(s)
+}
+
+#[tauri::command]
+pub async fn delete_note(app: AppHandle, uuid: String) -> Result<NoteSummary, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let _gate = st.sync_gate.lock().await;
+    let mut v = vault_or_err(&st)?;
+    let u: Uuid = uuid.parse::<Uuid>().map_err(|e| e.to_string())?;
+    let s = v.delete(&u).map_err(|e| e.to_string())?;
+    st.put_vault(v);
+    // clone: `_gate` borrows `st` until end of scope
+    schedule_push(app, st.clone());
+    Ok(s)
+}
+
+#[tauri::command]
+pub async fn rename_note(
+    app: AppHandle,
+    uuid: String,
+    new_path: String,
+) -> Result<NoteSummary, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let _gate = st.sync_gate.lock().await;
+    let mut v = vault_or_err(&st)?;
+    let u: Uuid = uuid.parse::<Uuid>().map_err(|e| e.to_string())?;
+    let s = v.rename(&u, &new_path).map_err(|e| e.to_string())?;
+    st.put_vault(v);
+    // clone: `_gate` borrows `st` until end of scope
+    schedule_push(app, st.clone());
+    Ok(s)
+}
+
+#[tauri::command]
+pub fn search_notes(app: AppHandle, query: String) -> Result<Vec<NoteSummary>, String> {
+    let st = (*app.state::<AppState>()).clone();
+    Ok(vault_or_err(&st)?.search(&query))
+}
+
+#[tauri::command]
+pub async fn rescan(app: AppHandle) -> Result<Vec<NoteSummary>, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let _gate = st.sync_gate.lock().await;
+    let mut v = vault_or_err(&st)?;
+    v.scan_and_repair().map_err(|e| e.to_string())?;
+    let notes = v.live_notes();
+    st.put_vault(v);
+    Ok(notes)
+}
+
+#[tauri::command]
+pub fn backlinks(app: AppHandle, uuid: String) -> Result<Vec<Backlink>, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let v = vault_or_err(&st)?;
+    let u: Uuid = uuid.parse::<Uuid>().map_err(|e| e.to_string())?;
+    Ok(spidernotes_core::wikilink::backlinks(&v, &u)
+        .into_iter()
+        .map(|(note, count)| Backlink { note, count })
+        .collect())
+}
+
+#[tauri::command]
+pub fn all_tags(app: AppHandle) -> Result<Vec<TagCount>, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let v = vault_or_err(&st)?;
+    Ok(spidernotes_core::wikilink::all_tags(&v)
+        .into_iter()
+        .map(|(tag, count)| TagCount { tag, count })
+        .collect())
+}
+
+#[tauri::command]
+pub fn notes_with_tag(app: AppHandle, tag: String) -> Result<Vec<NoteSummary>, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let v = vault_or_err(&st)?;
+    Ok(spidernotes_core::wikilink::notes_with_tag(&v, &tag))
+}
+
+#[tauri::command]
+pub fn device_info(app: AppHandle) -> Result<DeviceInfo, String> {
+    let st = (*app.state::<AppState>()).clone();
+    Ok(DeviceInfo {
+        id: st.identity.id.clone(),
+        name: st.identity.name.clone(),
+    })
+}
+
+#[tauri::command]
+ pub fn list_peers(app: AppHandle) -> Result<Vec<PeerInfo>, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let peers = st.peers_cache.lock().unwrap().clone();
+    Ok(peers)
+ }
+
+ #[tauri::command]
+ pub fn list_trusted(app: AppHandle) -> Result<Vec<spidernotes_core::TrustedDevice>, String> {
+    let st = (*app.state::<AppState>()).clone();
+    Ok(st.trust.list())
+ }
+
+ #[tauri::command]
+ pub fn trust_device(
+    app: AppHandle,
+    device_id: String,
+    name: String,
+) -> Result<Vec<spidernotes_core::TrustedDevice>, String> {
+    let st = (*app.state::<AppState>()).clone();
+     if let Err(e) = st.trust.add(&device_id, &name) {
+         tracing::error!("trust_device failed for {} ({}): {e}", name, device_id);
+         return Err(format!("cannot save trust list: {e}"));
+     }
+     tracing::info!("trusted device {} ({})", name, device_id);
+     Ok(st.trust.list())
+  }
+
+ #[tauri::command]
+ pub fn untrust_device(app: AppHandle, device_id: String)
+ -> Result<Vec<spidernotes_core::TrustedDevice>, String> {
+    let st = (*app.state::<AppState>()).clone();
+     if let Err(e) = st.trust.remove(&device_id) {
+         tracing::error!("untrust_device failed for {device_id}: {e}");
+         return Err(format!("cannot save trust list: {e}"));
+     }
+   tracing::info!("untrusted device {device_id}");
+     Ok(st.trust.list())
+   }
+
+#[tauri::command]
+pub fn p2p_settings(app: AppHandle) -> Result<P2pSettings, String> {
+    let st = (*app.state::<AppState>()).clone();
+    Ok(P2pSettings {
+        autosync_secs: st.autosync_secs.load(Ordering::SeqCst),
+        p2p_port: st.p2p_port.load(Ordering::SeqCst),
+        p2p_port_setting: st.p2p_port_setting.load(Ordering::SeqCst),
+        p2p_running: st.p2p_running.load(Ordering::SeqCst),
+    })
+}
+
+#[tauri::command]
+pub fn set_autosync_secs(app: AppHandle, secs: u64) -> Result<u64, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let v = secs.clamp(1, 3600);
+    st.autosync_secs.store(v, Ordering::SeqCst);
+    tracing::info!("auto-sync interval set to {v}s");
+    Ok(v)
+}
+
+#[tauri::command]
+pub fn set_p2p_port_setting(app: AppHandle, port: u16) -> Result<u16, String> {
+    let st = (*app.state::<AppState>()).clone();
+    if port == 0 {
+        return Err("port 0 is not allowed".to_string());
+    }
+    st.p2p_port_setting.store(port, Ordering::SeqCst);
+  tracing::info!("P2P port setting set to {port} (applied on P2P restart)");
+    Ok(port)
+ }
+
+/// Background sync (Android only): start/stop the foreground service that
+ /// keeps the process — and with it the mDNS/TCP sync loops — alive while
+ /// the app is backgrounded. No-op on desktop.
+ #[tauri::command]
+ pub async fn set_bg_sync(app: AppHandle, enabled: bool) -> Result<(), String> {
+     #[cfg(target_os = "android")]
+     {
+         let Some(st) = app.try_state::<spidernotes_fgservice::FgState<tauri::Wry>>() else {
+             return Err("background sync unavailable (plugin failed to register)".into());
+         };
+         let cmd = if enabled { "start" } else { "stop" };
+         st.handle
+             .run_mobile_plugin_async::<()>(cmd, ())
+             .await
+             .map_err(|e| e.to_string())
+     }
+     #[cfg(not(target_os = "android"))]
+     {
+         let _ = (app, enabled);
+         Ok(())
+     }
+ }
+
+  /// Ask the discovery loop to recreate the mDNS daemon immediately.
+/// Fired by the frontend when the app returns to the foreground: on
+/// Android, backgrounding kills the multicast socket, so the daemon must be
+/// rebuilt before peers (and with them sync) come back.
+#[tauri::command]
+pub fn mdns_refresh(app: AppHandle) -> Result<(), String> {
+    let st = (*app.state::<AppState>()).clone();
+    if !st.p2p_running.load(Ordering::SeqCst) {
+        return Ok(()); // nothing to refresh; P2P not started
+    }
+    let next = *st.mdns_refresh_tx.borrow() + 1;
+    let _ = st.mdns_refresh_tx.send_replace(next);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn restart_p2p(app: AppHandle) -> Result<u16, String> {
+    let st = (*app.state::<AppState>()).clone();
+    if !st.p2p_running.load(Ordering::SeqCst) {
+        return Err("P2P is not running; open a vault first".to_string());
+    }
+    let old_port = st.p2p_port.load(Ordering::SeqCst);
+    let want = st.p2p_port_setting.load(Ordering::SeqCst);
+    // Always restart (even with the same port): this is also the manual
+    // escape hatch for a stuck discovery daemon.
+    // tear down the current P2P generation (accept / discovery / ticker loops)
+    if let Some(tx) = st.p2p_stop.lock().unwrap().take() {
+        let _ = tx.send(true);
+    }
+    st.p2p_running.store(false, Ordering::SeqCst);
+    // give the old loops a moment to drop the mDNS registration and sockets
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let bound = match SyncListener::bind(want).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("bind port {want} failed ({e}); falling back to {old_port}");
+            SyncListener::bind(old_port)
+                .await
+                .map_err(|e2| format!("cannot bind port {want} or fallback {old_port}: {e2}"))?
+        }
+    };
+    let actual = bound.port();
+    start_p2p(app, &st, bound, actual)?;
+    st.p2p_running.store(true, Ordering::SeqCst);
+    st.p2p_port.store(actual, Ordering::SeqCst);
+    Ok(actual)
+}
+
+#[tauri::command]
+pub async fn sync_with(app: AppHandle, peer: PeerInfo) -> Result<P2pSyncReport, String> {
+    let st = (*app.state::<AppState>()).clone();
+    if !st.trust.is_trusted(&peer.device_id) {
+        return Err(format!(
+            "device {} is not trusted; approve it first",
+            peer.name
+        ));
+    }
+    let _gate = st.sync_gate.lock().await;
+    let mut v = vault_or_err(&st)?;
+    let addr = parse_peer_addr(&peer.address, peer.port)
+        .ok_or_else(|| format!("bad address for {}: {}", peer.name, peer.address))?;
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| format!("connect timeout to {addr}"))?
+        .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
+    let report = sync_initiator(stream, &st.identity, peer.x25519_pub, &mut v)
+        .await
+        .map_err(|e| format!("sync failed: {e}"))?;
+    st.put_vault(v);
+    let _ = app.emit("notes-changed", ());
+    Ok(report)
+}
+
+#[tauri::command]
+pub async fn sync_all(app: AppHandle) -> Result<Vec<P2pSyncReport>, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let _gate = st.sync_gate.lock().await;
+    let mut v = vault_or_err(&st)?;
+    let peers = st.peers_cache.lock().unwrap().clone();
+    let out = sync_vault_with_peers(&st, &app, &mut v, &peers).await;
+    st.put_vault(v);
+    Ok(out)
+}
+
+
