@@ -27,9 +27,12 @@ jobs:
           - os: macos-latest
             name: macos
             bundles: app,dmg
-            # ** covers both target/release/... and target/universal-apple-darwin/release/...
+            # universal build only (one fat dmg for Intel + Apple Silicon).
+            # Keep this glob exact: the cargo cache restores stale per-arch
+            # bundle dirs, and a broader ** glob would leak them into the
+            # release (happened: a stale aarch64-only dmg got published).
             artifacts: |
-              target/**/bundle/dmg/*.dmg
+              target/universal-apple-darwin/release/bundle/dmg/*.dmg
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
