@@ -66,6 +66,25 @@ export function PeersPanel(props: {
   const [bgSync, setBgSync] = useState(
     localStorage.getItem("sn.bgSync") !== "0"
   );
+  // relay server settings (persisted as one JSON blob in localStorage)
+  const [ss, setSs] = useState(() => {
+    try {
+      const raw = JSON.parse(localStorage.getItem("sn.serverSync") || "null");
+      return raw && raw.enabled
+        ? {
+            enabled: true,
+            host: raw.host || "",
+            port: raw.port || 8788,
+            room: raw.room || "",
+            secret: raw.secret || "",
+          }
+        : { enabled: false, host: "", port: 8788, room: "", secret: "" };
+    } catch {
+      return { enabled: false, host: "", port: 8788, room: "", secret: "" };
+    }
+  });
+  const [ssStatus, setSsStatus] = useState("");
+  const [ssBusy, setSsBusy] = useState(false);
   // In-app confirmation (window.confirm in the webview is unreliable: the
   // native dialog can close without the result reaching the JS).
   const [confirmPeer, setConfirmPeer] = useState<PeerInfo | null>(null);
@@ -100,9 +119,60 @@ export function PeersPanel(props: {
     };
   }, []);
 
+  // Poll the relay status while the panel is open (the backend keeps
+  // reconnecting in the background; no dedicated event for its status line).
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => {
+      api
+        .serverSyncStatus()
+        .then((s) => {
+          if (!cancelled) setSsStatus(s.status);
+        })
+        .catch(() => {});
+    };
+    poll();
+    const t = window.setInterval(poll, 4000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, []);
+
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [props.log]);
+
+  const applyServerSync = async () => {
+    const next = {
+      ...ss,
+      host: ss.host.trim(),
+      room: ss.room.trim(),
+      port: Math.max(1, Math.min(65535, Math.round(ss.port) || 8788)),
+    };
+    setSs(next);
+    localStorage.setItem("sn.serverSync", JSON.stringify(next));
+    setSsBusy(true);
+    try {
+      const res = await api.setServerSync(
+        next.enabled,
+        next.host,
+        next.port,
+        next.room,
+        next.secret
+      );
+      setSsStatus(res.status);
+      props.onLog?.(
+        next.enabled
+          ? `server sync: room "${next.room}" @ ${next.host}:${next.port}`
+          : "server sync: off"
+      );
+    } catch (e) {
+      props.onLog?.(`server sync: ${e}`);
+    } finally {
+      setSsBusy(false);
+    }
+  };
 
   const applyAutosync = () => {
     const n = Math.max(1, Math.min(3600, Math.round(autosyncSecs) || 30));
@@ -205,7 +275,7 @@ export function PeersPanel(props: {
       </div>
       <div className="pad peers">
         {props.peers.length === 0 && (
-          <div className="muted">No peers found (mDNS)</div>
+          <div className="muted">No peers found (mDNS / server)</div>
         )}
         {props.peers.length > 0 && (
           <div className="muted small">
@@ -220,10 +290,18 @@ export function PeersPanel(props: {
             <div key={p.device_id} className="peer">
               <div className="peer-meta">
                 <div className="peer-name">
-                  {p.name} {trusted && <span className="trust-badge">✓</span>}
+                  {p.name} {trusted && <span className="trust-badge">✓</span>}{" "}
+                  {p.via_server && (
+                    <span
+                      className="trust-badge"
+                      title="discovered through the relay server"
+                    >
+                      server
+                    </span>
+                  )}
                 </div>
                 <div className="muted small">
-                  {p.address}:{p.port}
+                  {p.via_server ? "via relay server" : `${p.address}:${p.port}`}
                 </div>
                 <div className="muted small">
                   <IdChip id={p.device_id} />
@@ -367,6 +445,70 @@ export function PeersPanel(props: {
         <div className="muted small" title={props.vaultPath}>
           vault: {props.vaultPath}
         </div>
+      </div>
+
+      <h2>Server sync</h2>
+      <div className="pad adv">
+        <div className="muted small">
+          A relay server lets devices sync when mDNS cannot find them
+          (different subnets / NAT / VPN). Enter the same Room name on all
+          devices to group them (the room is created automatically); the
+          Secret is the server's single shared key. Sync stays end-to-end
+          encrypted — the server only relays ciphertext.
+        </div>
+        <label className="adv-row">
+          <span>Use sync server</span>
+          <input
+            type="checkbox"
+            checked={ss.enabled}
+            onChange={(e) => setSs({ ...ss, enabled: e.target.checked })}
+          />
+        </label>
+        <label className="adv-row">
+          <span>Host</span>
+          <input
+            className="inp"
+            type="text"
+            placeholder="192.168.1.50 or myserver.local"
+            value={ss.host}
+            onChange={(e) => setSs({ ...ss, host: e.target.value })}
+          />
+        </label>
+        <label className="adv-row">
+          <span>Port</span>
+          <input
+            className="inp num"
+            type="number"
+            min={1}
+            max={65535}
+            value={ss.port}
+            onChange={(e) => setSs({ ...ss, port: Number(e.target.value) })}
+          />
+        </label>
+        <label className="adv-row">
+          <span>Room</span>
+          <input
+            className="inp"
+            type="text"
+            placeholder="my-room"
+            value={ss.room}
+            onChange={(e) => setSs({ ...ss, room: e.target.value })}
+          />
+        </label>
+        <label className="adv-row">
+          <span>Secret</span>
+          <input
+            className="inp"
+            type="password"
+            placeholder="server secret (one for all rooms)"
+            value={ss.secret}
+            onChange={(e) => setSs({ ...ss, secret: e.target.value })}
+          />
+        </label>
+        <button className="wide" disabled={ssBusy} onClick={() => void applyServerSync()}>
+          {ss.enabled ? "Save & connect" : "Turn off"}
+        </button>
+        <div className="muted small">{ssStatus || "server sync is off"}</div>
       </div>
 
       <h2>Log</h2>

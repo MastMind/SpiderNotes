@@ -37,6 +37,7 @@ export default function App() {
   const [open, setOpen] = useState<OpenResult | null>(null);
   const [pathInput, setPathInput] = useState(savedVaultPath());
   const [notes, setNotes] = useState<NoteSummary[]>([]);
+  const [folders, setFolders] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [doc, setDoc] = useState("");
   const [dirty, setDirty] = useState(false);
@@ -82,6 +83,8 @@ export default function App() {
   selectedRef.current = selected;
   const notesRef = useRef(notes);
   notesRef.current = notes;
+  const foldersRef = useRef(folders);
+  foldersRef.current = folders;
   const dirtyRef = useRef(dirty);
   dirtyRef.current = dirty;
   const autosaveMsRef = useRef(autosaveSecs * 1000);
@@ -93,9 +96,14 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [n, t] = await Promise.all([api.listNotes(), api.allTags()]);
+      const [n, t, f] = await Promise.all([
+        api.listNotes(),
+        api.allTags(),
+        api.listFolders(),
+      ]);
       setNotes(n);
       setTags(t);
+      setFolders(f);
     } catch (e) {
       addLog(`list read error: ${e}`);
     }
@@ -142,6 +150,7 @@ export default function App() {
         setOpen(res);
         setNotes(res.notes);
         setPeers(res.peers);
+        setFolders(res.folders);
       } catch {
         // not in a Tauri context (plain browser) — stay on the welcome screen
       }
@@ -174,6 +183,14 @@ export default function App() {
         if (p > 0) await api.setP2pPortSetting(p);
         // background sync (Android foreground service) is on unless disabled
         await api.setBgSync(localStorage.getItem("sn.bgSync") !== "0");
+        // relay server: re-enable the stored room (backend state is
+        // in-memory, so nothing persists across app restarts)
+        const ss = JSON.parse(
+          localStorage.getItem("sn.serverSync") || "null"
+        ) as { enabled: boolean; host: string; port: number; room: string; secret: string } | null;
+        if (ss && ss.enabled && ss.host && ss.room && ss.secret) {
+          await api.setServerSync(true, ss.host, ss.port, ss.room, ss.secret);
+        }
       } catch {
         // not in a Tauri context; ignore
       }
@@ -212,6 +229,51 @@ export default function App() {
     localStorage.setItem("sn.theme", theme);
     document.documentElement.dataset.theme = theme;
   }, [theme]);
+
+  // Edge swipes (touch): from the screen's left edge, swipe RIGHT to open
+  // the notes list; from within the open list, swipe LEFT to close it.
+  // A long-press note drag renders a .drag-ghost — while it exists the
+  // close-swipe is ignored so a drag never collapses the panel.
+  const showSidebarRef = useRef(showSidebar);
+  showSidebarRef.current = showSidebar;
+  useEffect(() => {
+    let start: { x: number; y: number; inSidebar: boolean } | null = null;
+    const onStart = (e: TouchEvent) => {
+      const t = e.touches[0];
+      if (!t) return;
+      const el = e.target as Element | null;
+      start = {
+        x: t.clientX,
+        y: t.clientY,
+        inSidebar: !!el?.closest?.(".sidebar"),
+      };
+    };
+    const onEnd = (e: TouchEvent) => {
+      const s = start;
+      start = null;
+      const t = e.changedTouches[0];
+      if (!s || !t) return;
+      const dx = t.clientX - s.x;
+      const dy = t.clientY - s.y;
+      if (Math.abs(dx) < 60 || Math.abs(dx) <= 1.5 * Math.abs(dy)) return;
+      if (dx > 0 && s.x <= 24 && !showSidebarRef.current) {
+        setShowSidebar(true);
+      } else if (
+        dx < 0 &&
+        s.inSidebar &&
+        showSidebarRef.current &&
+        !document.querySelector(".drag-ghost")
+      ) {
+        setShowSidebar(false);
+      }
+    };
+    window.addEventListener("touchstart", onStart, { passive: true });
+    window.addEventListener("touchend", onEnd, { passive: true });
+    return () => {
+      window.removeEventListener("touchstart", onStart);
+      window.removeEventListener("touchend", onEnd);
+    };
+  }, []);
 
   // First launch: fill the vault path with a platform-appropriate default
   // (desktop: ~/Documents/SpiderNotes; mobile: the app's internal storage).
@@ -375,6 +437,7 @@ export default function App() {
       setOpen(res);
       setNotes(res.notes);
       setPeers(res.peers);
+      setFolders(res.folders);
       addLog(
         `vault opened: ${res.path} (P2P port ${res.p2p_port}, device ${res.device_name})`,
       );
@@ -432,6 +495,131 @@ export default function App() {
       setError(String(e));
     }
   }, [addLog, refresh]);
+
+  const doCreateFolder = useCallback(
+    async (parentDir: string) => {
+      const name = window.prompt(
+        parentDir ? `New folder in ${parentDir}:` : "New folder:",
+      );
+      if (!name || !name.trim()) return;
+      const clean = name.trim();
+      if (clean.includes("/") || clean.includes("\\") || clean === "..") {
+        setError("Folder names cannot contain / or \\");
+        return;
+      }
+      const path = parentDir ? `${parentDir}/${clean}` : clean;
+      try {
+        const created = await api.createFolder(path);
+        addLog(`folder created: ${created}`);
+        await refresh();
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [addLog, refresh],
+  );
+
+  const doRenameFolder = useCallback(
+    async (path: string) => {
+      const np = window.prompt("New folder path:", path);
+      if (!np || np.trim() === path) return;
+      try {
+        const n = await api.renameFolder(path, np.trim());
+        addLog(`folder renamed: ${path} -> ${np.trim()} (${n} notes)`);
+        await refresh();
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [addLog, refresh],
+  );
+
+  const doDeleteFolder = useCallback(
+    async (path: string) => {
+      const count = notesRef.current.filter((n) =>
+        n.path.startsWith(`${path}/`),
+      ).length;
+      if (
+        !window.confirm(
+          `Delete folder "${path}"${count ? ` and its ${count} note(s)` : ""}?`,
+        )
+      )
+        return;
+      try {
+        const deleted = await api.deleteFolder(path);
+        addLog(`folder deleted: ${path} (${deleted.length} notes)`);
+        // close the editor if the open note lived inside
+        const sel = selectedRef.current;
+        if (
+          sel &&
+          deleted.some((d) => d.uuid === sel)
+        ) {
+          setSelected(null);
+          setDoc("");
+        }
+        await refresh();
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [addLog, refresh],
+  );
+
+  const doMoveFolder = useCallback(
+    async (oldPath: string, destDir: string) => {
+      const base = oldPath.split("/").pop() ?? oldPath;
+      const newPath = destDir ? `${destDir}/${base}` : base;
+      if (newPath === oldPath) return; // dropped where it already is
+      try {
+        const n = await api.renameFolder(oldPath, newPath);
+        addLog(`folder moved: ${oldPath} -> ${newPath} (${n} notes)`);
+        await refresh();
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [addLog, refresh],
+  );
+
+  const doMoveNote = useCallback(
+    async (uuid: string, destDir: string | null) => {
+      const n = notesRef.current.find((x) => x.uuid === uuid);
+      if (!n) return;
+      const base = n.path.split("/").pop() ?? n.path;
+      const newDir = destDir ?? "";
+      const curDir = n.path.slice(0, n.path.length - base.length).replace(/\/$/, "");
+      if (newDir === curDir) return; // dropped where it already is
+      const newPath = newDir ? `${newDir}/${base}` : base;
+      try {
+        await api.renameNote(uuid, newPath);
+        addLog(`moved: ${n.path} -> ${newPath}`);
+        await refresh();
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [addLog, refresh],
+  );
+
+  const doDeleteNoteByUuid = useCallback(
+    async (uuid: string) => {
+      const n = notesRef.current.find((x) => x.uuid === uuid);
+      if (!n) return;
+      if (!window.confirm(`Delete ${n.path}?`)) return;
+      try {
+        await api.deleteNote(uuid);
+        if (selectedRef.current === uuid) {
+          setSelected(null);
+          setDoc("");
+        }
+        addLog(`deleted: ${n.path}`);
+        await refresh();
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [addLog, refresh],
+  );
 
   const doSync = useCallback(
     async (peer: PeerInfo) => {
@@ -537,7 +725,25 @@ export default function App() {
 
       <div className="body">
         {showSidebar && (
-        <aside className="sidebar">
+        <aside
+          className="sidebar"
+          onContextMenu={(e) => {
+            // Notes/folders have their own menus (stopPropagation), inputs
+            // keep the native one (copy/paste); anywhere else in the panel
+            // opens the root menu (New folder)
+            const t = e.target as Element | null;
+            if (
+              t?.closest("input, select, textarea, .tree-item, .tree-dir, .ctx-menu")
+            )
+              return;
+            e.preventDefault();
+            window.dispatchEvent(
+              new CustomEvent("sn-root-menu", {
+                detail: { x: e.clientX, y: e.clientY },
+              })
+            );
+          }}
+        >
           <div className="pad">
             <input
               className="inp"
@@ -585,9 +791,16 @@ export default function App() {
                     ? tagNotes ?? []
                     : notes
               }
-              query=""
+              folders={query.trim() || activeTag ? [] : folders}
+              allFolders={folders}
               selected={selected}
               onSelect={selectNote}
+              onCreateFolder={doCreateFolder}
+              onRenameFolder={doRenameFolder}
+              onDeleteFolder={doDeleteFolder}
+             onMoveNote={(uuid, dir) => void doMoveNote(uuid, dir)}
+                onDeleteNote={(uuid) => void doDeleteNoteByUuid(uuid)}
+                onMoveFolder={(path, dir) => void doMoveFolder(path, dir)}
             />
             {(query.trim() || activeTag) && (
               <button

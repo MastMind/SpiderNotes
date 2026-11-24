@@ -138,6 +138,8 @@ impl Vault {
         if abs.exists() {
             std::fs::remove_file(&abs).with_context(|| format!("rm {}", abs.display()))?;
         }
+        // the folder is intentionally kept when it becomes empty (same as
+        // right after creation); the user removes it explicitly if wanted
         let hlc = self.next_clock();
         let summary = NoteSummary {
             uuid: *uuid,
@@ -169,6 +171,7 @@ impl Vault {
         }
         std::fs::rename(&old_abs, &new_abs)
             .with_context(|| format!("rename {} -> {}", old_abs.display(), new_abs.display()))?;
+        // the old folder is kept when the move empties it
         let hlc = self.next_clock();
         let summary = NoteSummary {
             uuid: *uuid,
@@ -182,6 +185,107 @@ impl Vault {
         self.reconcile_path(&new_rel)?;
         self.save_index()?;
         Ok(summary)
+    }
+
+    /// Create a (possibly nested) folder inside the vault.
+    /// Empty folders are local-only: folders have no index entries, so a peer
+    /// learns about a folder when a note is moved into it (or created there).
+    pub fn create_folder(&mut self, rel_dir: &str) -> Result<String> {
+        let rel = normalize_dir_rel_path(rel_dir)?;
+        let abs = self.root.join(&rel);
+        std::fs::create_dir_all(&abs)
+            .with_context(|| format!("mkdir {}", abs.display()))?;
+        Ok(rel)
+    }
+
+    /// Rename/move a folder: the directory on disk plus every index entry
+    /// (live notes AND tombstones) whose path lies under it. Each moved entry
+    /// gets a fresh HLC so the move lands in sync deltas like any edit.
+    /// Returns the number of index entries moved.
+    pub fn rename_folder(&mut self, old_rel: &str, new_rel: &str) -> Result<usize> {
+        let old = normalize_dir_rel_path(old_rel)?;
+        let new = normalize_dir_rel_path(new_rel)?;
+        if old == new {
+            bail!("folder already has that name");
+        }
+        if new.starts_with(&format!("{old}/")) {
+            bail!("cannot move a folder into its own subtree: {new}");
+        }
+        let old_abs = self.root.join(&old);
+        let new_abs = self.root.join(&new);
+        if !old_abs.is_dir() {
+            bail!("folder not found: {old}");
+        }
+        if new_abs.exists() {
+            bail!("folder already exists: {new}");
+        }
+        if let Some(parent) = new_abs.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+        std::fs::rename(&old_abs, &new_abs)
+            .with_context(|| format!("rename folder {old} -> {new}"))?;
+
+        let old_prefix = format!("{old}/");
+        let new_prefix = format!("{new}/");
+        let moved: Vec<(Uuid, NoteSummary)> = self
+            .index
+            .notes
+            .iter()
+            .filter(|(_, s)| s.path.starts_with(&old_prefix))
+            .map(|(u, s)| (*u, s.clone()))
+            .collect();
+        let count = moved.len();
+        for (u, s) in moved {
+            let new_path = format!("{}{}", new_prefix, &s.path[old_prefix.len()..]);
+            let hlc = self.next_clock();
+            self.index.notes.insert(
+                u,
+                NoteSummary {
+                    uuid: u,
+                    path: new_path,
+                    hlc,
+                    hash: s.hash,
+                    deleted: s.deleted,
+                },
+            );
+        }
+        self.save_index()?;
+        Ok(count)
+    }
+
+    /// Delete a folder: every note under it is deleted (file removed +
+    /// tombstone, like a single-note delete, so the deletion propagates),
+    /// then the directory tree is removed from disk. Returns the deleted
+    /// summaries.
+    pub fn delete_folder(&mut self, rel_dir: &str) -> Result<Vec<NoteSummary>> {
+        let rel = normalize_dir_rel_path(rel_dir)?;
+        let prefix = format!("{rel}/");
+        let doomed: Vec<Uuid> = self
+            .index
+            .notes
+            .iter()
+            .filter(|(_, s)| !s.deleted && s.path.starts_with(&prefix))
+            .map(|(u, _)| *u)
+            .collect();
+        let mut out = Vec::new();
+        for u in doomed {
+            let s = self.delete(&u)?;
+            out.push(s);
+        }
+        let abs = self.root.join(&rel);
+        if abs.exists() {
+            std::fs::remove_dir_all(&abs)
+                .with_context(|| format!("rmdir {}", abs.display()))?;
+        }
+        Ok(out)
+    }
+
+    /// All vault folders as relative slash-separated paths, sorted.
+    pub fn list_folders(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        walk_dirs(&self.root, &self.root, &mut out);
+        out.sort();
+        out
     }
 
     /// Search note bodies (case-insensitive substring). Returns matching summaries.
@@ -247,11 +351,20 @@ impl Vault {
         }
 
         self.absorb_clock(&u.hlc);
+        // The note's PREVIOUS location (same uuid, different path) — a remote
+        // move. The old file must go away here: if it stayed on disk with no
+        // index entry pointing at its path, the next scan_and_repair would see
+        // it as a "manually added file", read its frontmatter id (the same
+        // uuid) and re-index it at the OLD path with a fresh (newest) HLC —
+        // the note would fly back, overwriting the move, and flip on every
+        // vault open.
+        let prev = self.index.notes.get(&u.uuid).cloned();
         if u.deleted {
             let abs = self.abs_path(&u.path);
             if abs.exists() {
                 let _ = std::fs::remove_file(&abs);
             }
+            // emptied folders are kept (same as on the sender)
             self.index.notes.insert(u.uuid, incoming);
         } else {
             let content = u
@@ -266,6 +379,15 @@ impl Vault {
             std::fs::write(&abs, with_id.as_bytes())?;
             incoming.hash = u.hash.clone().unwrap_or_else(|| body_hash(content));
             self.index.notes.insert(u.uuid, incoming);
+        }
+        if let Some(p) = &prev {
+            if p.path != u.path {
+                let old_abs = self.abs_path(&p.path);
+                if old_abs.exists() {
+                    let _ = std::fs::remove_file(&old_abs);
+                }
+                // the folder the note moved out of is kept when empty
+            }
         }
         self.reconcile_path(&u.path)?;
         self.save_index()?;
@@ -473,6 +595,47 @@ pub fn normalize_rel_path(p: &str) -> Result<String> {
         bail!("only .md notes are supported: {p}");
     }
     Ok(trimmed.to_string())
+}
+
+/// Normalize a relative folder path: strip leading/trailing `/`, forbid
+/// `..`, `.`, empty components and the reserved index dir.
+pub fn normalize_dir_rel_path(p: &str) -> Result<String> {
+    let trimmed = p.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        bail!("empty folder path");
+    }
+    for comp in trimmed.split('/') {
+        if comp == ".." {
+            bail!("path component '..' not allowed: {p}");
+        }
+        if comp == "." || comp.is_empty() {
+            bail!("bad path component in folder: {p}");
+        }
+        if comp == Index::DIR {
+            bail!("folder name {comp} is reserved");
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
+fn walk_dirs(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if p.file_name().map(|n| n == Index::DIR).unwrap_or(false) {
+            continue;
+        }
+        if let Ok(rel) = p.strip_prefix(root) {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+        walk_dirs(root, &p, out);
+    }
 }
 
 fn walk_md(root: &Path) -> Result<Vec<PathBuf>> {
@@ -683,5 +846,102 @@ mod tests {
         let r = v.search("apple");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].path, "a.md");
+    }
+
+    #[test]
+    fn create_and_list_folders() {
+        let (mut v, g) = mk_vault();
+        v.create_folder("a/b").unwrap();
+        v.create_folder("c").unwrap();
+        assert_eq!(
+            v.list_folders(),
+            vec!["a".to_string(), "a/b".to_string(), "c".to_string()]
+        );
+        assert!(g.0.join("a/b").is_dir());
+        // bad names are rejected
+        assert!(v.create_folder("").is_err());
+        assert!(v.create_folder("/").is_err());
+        assert!(v.create_folder("a/../b").is_err());
+        assert!(v.create_folder("a//b").is_err());
+        assert!(v.create_folder(".spidernotes").is_err());
+        assert!(v.create_folder("a/.spidernotes").is_err());
+    }
+
+    #[test]
+    fn rename_folder_moves_notes_and_bumps_hlc() {
+        let (mut v, g) = mk_vault();
+        let s = v.write("work/a.md", "A").unwrap();
+        let t = v.write("work/sub/b.md", "B").unwrap();
+        let n = v.rename_folder("work", "office").unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(v.get(&s.uuid).unwrap().path, "office/a.md");
+        assert_eq!(v.get(&t.uuid).unwrap().path, "office/sub/b.md");
+        assert!(v.get(&s.uuid).unwrap().hlc > s.hlc, "moved note must enter sync deltas");
+        assert!(g.0.join("office/a.md").exists());
+        assert!(!g.0.join("work").exists());
+    }
+
+    #[test]
+    fn rename_folder_moves_tombstones_too() {
+        let (mut v, g) = mk_vault();
+        let s = v.write("old/a.md", "A").unwrap();
+        v.write("old/b.md", "B").unwrap();
+        v.delete(&s.uuid).unwrap();
+        // the folder survives (b.md inside) and its tombstone moves with it
+        v.rename_folder("old", "new").unwrap();
+        let ts = v.get(&s.uuid).unwrap();
+        assert!(ts.deleted);
+        assert_eq!(ts.path, "new/a.md");
+        assert!(g.0.join("new/b.md").exists());
+        assert!(!g.0.join("old").exists());
+    }
+
+    #[test]
+    fn delete_folder_removes_all_notes() {
+        let (mut v, g) = mk_vault();
+        let a = v.write("f/a.md", "A").unwrap();
+        let b = v.write("f/nest/b.md", "B").unwrap();
+        v.write("root.md", "R").unwrap();
+        let deleted = v.delete_folder("f").unwrap();
+        assert_eq!(deleted.len(), 2);
+        assert!(v.get(&a.uuid).unwrap().deleted);
+        assert!(v.get(&b.uuid).unwrap().deleted);
+        assert!(!g.0.join("f").exists());
+        assert!(g.0.join("root.md").exists());
+    }
+
+    #[test]
+    fn moving_or_deleting_last_note_keeps_empty_dir() {
+        let (mut v, g) = mk_vault();
+        let s = v.write("dir/a.md", "A").unwrap();
+        v.rename(&s.uuid, "top.md").unwrap();
+        assert!(g.0.join("dir").exists(), "empty folder must stay after a move");
+        let t = v.write("dir2/b.md", "B").unwrap();
+        v.delete(&t.uuid).unwrap();
+        assert!(g.0.join("dir2").exists(), "empty folder must stay after a delete");
+    }
+
+    #[test]
+    fn remote_move_removes_old_file() {
+        // A moves a note into a folder; B applies the update. The old file
+        // must vanish on B and a rescan must NOT resurrect it at the old path
+        // (frontmatter id would otherwise re-index it with a fresh HLC).
+        let (mut a, _ga) = mk_vault();
+        let s = a.write("x.md", "v1").unwrap();
+        let (mut b, _gb) = mk_vault();
+        b.apply_update(&s.to_update(Some("v1".into()))).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let m = a.rename(&s.uuid, "dir/x.md").unwrap();
+        b.apply_update(&m.to_update(Some("v1".into()))).unwrap();
+        assert_eq!(b.get(&s.uuid).unwrap().path, "dir/x.md");
+        let dir_b = b.root();
+        assert!(!dir_b.join("x.md").exists(), "old file must be removed");
+        assert!(dir_b.join("dir/x.md").exists());
+        b.scan_and_repair().unwrap();
+        assert_eq!(
+            b.get(&s.uuid).unwrap().path,
+            "dir/x.md",
+            "rescan must not resurrect the old path"
+        );
     }
 }

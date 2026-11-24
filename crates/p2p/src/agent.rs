@@ -10,6 +10,9 @@
 use crate::protocol::{my_delta, Msg};
 use crate::transport::SecureStream;
 use spidernotes_core::{DeviceIdentity, TrustStore, Vault};
+use std::marker::Unpin;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -42,12 +45,15 @@ fn warn_clock_skew(peer: &str, remote: &spidernotes_core::Hlc) {
     }
 }
 
-pub async fn sync_initiator(
-    stream: TcpStream,
+pub async fn sync_initiator<S>(
+    stream: S,
     identity: &DeviceIdentity,
     remote_pub: [u8; 32],
     vault: &mut Vault,
-) -> anyhow::Result<SyncReport> {
+) -> anyhow::Result<SyncReport>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut ss = SecureStream::initiator(stream, identity, remote_pub).await?;
     let mut report = SyncReport::default();
 
@@ -113,12 +119,15 @@ pub async fn sync_initiator(
     Ok(report)
 }
 
-pub async fn sync_responder(
-    stream: TcpStream,
+pub async fn sync_responder<S>(
+    stream: S,
     identity: &DeviceIdentity,
     vault: &mut Vault,
     trust: &TrustStore,
-) -> anyhow::Result<SyncReport> {
+) -> anyhow::Result<SyncReport>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut ss = SecureStream::accept(stream, identity).await?;
     let mut report = SyncReport::default();
 
@@ -186,6 +195,78 @@ pub async fn sync_responder(
         }
     }
     Ok(report)
+}
+
+/// Initiator-side sync with a hard cap and a human-readable error. Without
+/// the cap a peer that accepts but never answers (its responder was rejected
+/// because it is busy, and a relay session does not surface that as EOF)
+/// would block the caller — and, with the sync gate held, every save behind
+/// it — forever.
+///
+/// A "busy" error (see [`is_busy_error`]) means the peer is mid-sync with
+/// someone else; the peer answered fast and on purpose, so a short retry is
+/// safe and usually succeeds.
+pub async fn capped_initiator<S>(
+    stream: S,
+    identity: &DeviceIdentity,
+    remote_pub: [u8; 32],
+    vault: &mut Vault,
+    timeout: Duration,
+) -> Result<SyncReport, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(timeout, sync_initiator(stream, identity, remote_pub, vault)).await
+    {
+        Ok(r) => r.map_err(|e| format!("sync failed: {e}")),
+        Err(_) => Err(format!("sync timed out after {timeout:?}")),
+    }
+}
+
+/// Responder-side sync with a hard cap and a human-readable error (same
+/// reasoning as [`capped_initiator`]).
+pub async fn capped_responder<S>(
+    stream: S,
+    identity: &DeviceIdentity,
+    vault: &mut Vault,
+    trust: &TrustStore,
+    timeout: Duration,
+) -> Result<SyncReport, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(timeout, sync_responder(stream, identity, vault, trust)).await {
+        Ok(r) => r.map_err(|e| format!("sync failed: {e}")),
+        Err(_) => Err(format!("sync timed out after {timeout:?}")),
+    }
+}
+
+/// Busy rejection for an incoming session. A dropped relay session is NOT
+/// visible to the peer as EOF, so silently returning would leave the peer's
+/// initiator blocked until its timeout. Complete the Noise handshake and
+/// answer with a protocol error instead: the peer fails in milliseconds with
+/// a "busy" error and can retry on its next round.
+pub async fn reject_busy<S>(stream: S, identity: &DeviceIdentity) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Ok(mut ss) = SecureStream::accept(stream, identity).await else {
+        return Ok(()); // the peer already went away; nothing to tell it
+    };
+    ss.send_frame(
+        &Msg::Error {
+            message: "device busy — sync again in a moment".to_string(),
+        }
+        .encode(),
+    )
+    .await
+    .map_err(|e| format!("busy reject failed: {e}"))
+}
+
+/// True when an error string carries a peer's "busy" rejection
+/// (safe to retry after a short stagger).
+pub fn is_busy_error(e: &str) -> bool {
+    e.contains("busy")
 }
 
 /// Spawn the responder side for a given connection (used by tests and the app).
@@ -343,6 +424,55 @@ mod tests {
         let on_b = vault_b.get(&s.uuid).unwrap();
         assert!(on_b.deleted);
         assert!(!env_b.dir.join("doomed.md").exists());
+    }
+
+    #[tokio::test]
+    async fn move_note_propagates_and_old_file_vanishes() {
+        // A moves a note into a folder. B must end up with the note at the
+        // NEW path, the old file removed, and — critically — a rescan (vault
+        // re-open) must not resurrect the old path from the leftover file.
+        let (env_a, mut vault_a) = Env::new("mv-a");
+        let s = vault_a.write("x.md", "v1").unwrap();
+        let (env_b, mut vault_b) = Env::new("mv-b");
+        let (_ra, _rb, mut vault_b) = sync_once(&mut vault_a, &mut vault_b).await;
+        assert_eq!(vault_b.get(&s.uuid).unwrap().path, "x.md");
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        vault_a.rename(&s.uuid, "work/x.md").unwrap();
+
+        let (_ra2, _rb2, mut vault_b) = sync_once(&mut vault_a, &mut vault_b).await;
+        assert_eq!(vault_b.get(&s.uuid).unwrap().path, "work/x.md");
+        assert!(!env_b.dir.join("x.md").exists(), "old file must vanish on receiver");
+        assert!(env_b.dir.join("work/x.md").exists());
+
+        vault_b.scan_and_repair().unwrap();
+        assert_eq!(
+            vault_b.get(&s.uuid).unwrap().path,
+            "work/x.md",
+            "rescan must not resurrect the old path"
+        );
+        let _ = env_a;
+    }
+
+    #[tokio::test]
+    async fn folder_delete_propagates() {
+        let (env_a, mut vault_a) = Env::new("fd-a");
+        let s = vault_a.write("f/a.md", "A").unwrap();
+        let (env_b, mut vault_b) = Env::new("fd-b");
+        let (_ra, _rb, mut vault_b) = sync_once(&mut vault_a, &mut vault_b).await;
+        assert_eq!(vault_b.get(&s.uuid).unwrap().path, "f/a.md");
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let deleted = vault_a.delete_folder("f").unwrap();
+        assert_eq!(deleted.len(), 1);
+
+        let (_ra2, _rb2, mut vault_b) = sync_once(&mut vault_a, &mut vault_b).await;
+        assert!(vault_b.get(&s.uuid).unwrap().deleted);
+        assert!(!env_b.dir.join("f/a.md").exists());
+        // the emptied dir is kept on the receiver (empty folders are
+        // local state and are not pruned automatically)
+        assert!(env_b.dir.join("f").exists(), "emptied dir must stay");
+        let _ = env_a;
     }
 
     #[tokio::test]

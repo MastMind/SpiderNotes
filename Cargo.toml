@@ -3,12 +3,13 @@ resolver = "2"
 members = [
   "crates/core",
   "crates/p2p",
+  "crates/server",
   "app/src-tauri",
   "plugins/fgservice",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 authors = ["SpiderNotes"]
@@ -19,8 +20,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 rand = "0.8"
+bytes = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"

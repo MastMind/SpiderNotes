@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 use std::sync::{Arc, Mutex};
 use spidernotes_core::{DeviceIdentity, TrustStore, Vault};
 use spidernotes_p2p::discovery::PeerInfo;
+use spidernotes_p2p::server_client::ServerHandle;
 
 pub const DEFAULT_P2P_PORT: u16 = 8788;
 /// Default interval of the background auto-sync ("keep alive") loop.
@@ -15,6 +16,17 @@ pub const PUSH_DEBOUNCE_MS: u64 = 800;
 /// re-registers our service with the current IP (A records go stale after
 /// a DHCP change).
 pub const MDNS_REFRESH_SECS: u64 = 60;
+
+/// Relay-server settings chosen in the frontend. `None` means server sync is
+/// off. The secret lives only here (and in the frontend's localStorage); it
+/// is never returned by any command.
+#[derive(Clone)]
+pub struct ServerCfg {
+    pub host: String,
+    pub port: u16,
+    pub room: String,
+    pub secret: String,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -51,6 +63,16 @@ pub struct AppState {
   /// the daemon whenever this changes — e.g. when the app returns to the
   /// foreground on Android, where backgrounding kills the multicast socket.
   pub mdns_refresh_tx: tokio::sync::watch::Sender<u64>,
+  /// Relay-server settings (None = off).
+  pub server_cfg: Arc<Mutex<Option<ServerCfg>>>,
+  /// Peers seen in our relay room (replaced on every roster update).
+  pub server_peers: Arc<Mutex<Vec<PeerInfo>>>,
+  /// Live relay handle (open sessions while connected), None when down.
+  pub server_handle: Arc<Mutex<Option<ServerHandle>>>,
+  /// Stop handle for the relay client loop.
+  pub server_stop: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
+  /// Human-readable relay status line for the UI.
+  pub server_status: Arc<Mutex<String>>,
 }
 
 impl AppState {
@@ -71,7 +93,29 @@ impl AppState {
             change_seq: Arc::new(AtomicU64::new(0)),
             p2p_stop: Arc::new(Mutex::new(None)),
             mdns_refresh_tx,
+            server_cfg: Arc::new(Mutex::new(None)),
+            server_peers: Arc::new(Mutex::new(Vec::new())),
+            server_handle: Arc::new(Mutex::new(None)),
+            server_stop: Arc::new(Mutex::new(None)),
+            server_status: Arc::new(Mutex::new("server sync is off".into())),
         }
+    }
+
+    /// mDNS peers + relay peers, deduplicated by device id. Direct (mDNS)
+    /// wins: a device we can reach without the relay is always preferred.
+    /// Our own device id is never a peer (a stale persisted entry or a
+    /// server that lists the member in its own roster must not turn us
+    /// into a sync target for ourselves).
+    pub fn merged_peers(&self) -> Vec<PeerInfo> {
+        let mut map: std::collections::HashMap<String, PeerInfo> = std::collections::HashMap::new();
+        for p in self.server_peers.lock().unwrap().iter().chain(self.peers_cache.lock().unwrap().iter())
+        {
+            if p.device_id == self.identity.id {
+                continue;
+            }
+            map.insert(p.device_id.clone(), p.clone());
+        }
+        map.into_values().collect()
     }
 
     pub fn take_vault(&self) -> Option<Vault> {

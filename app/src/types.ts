@@ -26,6 +26,18 @@ export interface PeerInfo {
   x25519_pub: number[];
   address: string;
   port: number;
+  /** Discovered via the relay server (no direct mDNS address). */
+  via_server?: boolean;
+}
+
+export interface ServerSyncStatus {
+  enabled: boolean;
+  connected: boolean;
+  host: string;
+  port: number;
+  room: string;
+  peer_count: number;
+  status: string;
 }
 
 export interface P2pSyncReport {
@@ -42,6 +54,8 @@ export interface OpenResult {
   device_name: string;
   notes: NoteSummary[];
   peers: PeerInfo[];
+  /** Vault folders (relative slash-separated paths), including empty ones. */
+  folders: string[];
 }
 
 export interface DeviceInfo {

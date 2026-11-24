@@ -1,4 +1,5 @@
 mod commands;
+mod server_sync;
 mod state;
 
 use state::AppState;
@@ -32,6 +33,11 @@ pub fn run() {
                     .unwrap_or_else(|e| panic!("cannot load device identity: {e}"));
                 let trust = spidernotes_core::TrustStore::load_or_create_in(&dir)
                     .unwrap_or_else(|e| panic!("cannot load trust list: {e}"));
+                // Self-heal: an older build listed the device in its own relay
+                // roster, and with two identically-named devices a user could
+                // have trusted their OWN id. Syncing with oneself can never
+                // work — drop it from the allowlist.
+                let _ = trust.remove(&identity.id);
                 let peers_path = dir.join("peers.json");
                 app.manage(AppState::new(identity, trust, peers_path));
             }
@@ -41,6 +47,8 @@ pub fn run() {
                     .unwrap_or_else(|e| panic!("cannot load device identity: {e}"));
                 let trust = spidernotes_core::TrustStore::load_or_create()
                     .unwrap_or_else(|e| panic!("cannot load trust list: {e}"));
+                // Self-heal (same as the mobile branch above).
+                let _ = trust.remove(&identity.id);
                 let peers_path = spidernotes_core::identity::config_dir()
                     .expect("no config dir")
                     .join("peers.json");
@@ -63,6 +71,10 @@ pub fn run() {
             commands::default_vault_path,
             commands::vault_status,
             commands::list_notes,
+            commands::list_folders,
+            commands::create_folder,
+            commands::rename_folder,
+            commands::delete_folder,
             commands::read_note,
             commands::save_note,
             commands::delete_note,
@@ -84,7 +96,9 @@ pub fn run() {
             commands::set_bg_sync,
             commands::set_autosync_secs,
             commands::set_p2p_port_setting,
-            commands::restart_p2p
+            commands::restart_p2p,
+            commands::set_server_sync,
+            commands::server_sync_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

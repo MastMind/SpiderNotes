@@ -21,6 +21,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+rand = { workspace = true }
 dirs = { workspace = true }
 spidernotes-core = { path = "../../crates/core" }
 spidernotes-p2p = { path = "../../crates/p2p" }

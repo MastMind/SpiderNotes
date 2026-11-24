@@ -18,6 +18,9 @@ app/src-tauri/gen/android/local.properties
 # Local no-root Linux dev deps
 .sysdeps/
 
+# Local crash dumps
+core.*
+
 # Android release signing key (kept locally / in GitHub Actions secrets, never committed)
 app/src-tauri/keystore/
 

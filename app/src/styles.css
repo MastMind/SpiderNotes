@@ -259,12 +259,125 @@ button.danger {
   background: var(--accent2);
 }
 
+.tree-host {
+  position: relative;
+}
+
+.tree-item {
+  -webkit-touch-callout: none;
+  user-select: none;
+  touch-action: manipulation;
+}
+
 .tree-dir {
   cursor: pointer;
   color: var(--muted);
   font-size: 12px;
   padding: 2px 6px;
   user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: manipulation;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 5px;
+}
+
+/* hide the native <details> triangle — we draw our own folder glyph */
+.tree-dir::-webkit-details-marker {
+  display: none;
+}
+.tree-dir {
+  list-style: none;
+}
+
+.tree-dir .dir-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-dir .dir-count {
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.tree-dir.drop-target,
+.tree-item.drop-target {
+  background: var(--accent2);
+  outline: 1px solid var(--accent);
+}
+
+.drop-hint {
+  padding: 3px 8px;
+  font-size: 11px;
+  border-top: 1px dashed var(--border);
+}
+
+/* context menu (right-click / long-press) */
+.ctx-menu {
+  position: fixed;
+  z-index: 100;
+  min-width: 170px;
+  max-width: 260px;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  padding: 4px;
+}
+
+.ctx-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  padding: 4px 8px 3px;
+}
+
+.ctx-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 5px;
+  padding: 6px 8px;
+  color: var(--fg);
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ctx-item:hover {
+  background: var(--accent2);
+}
+
+.ctx-item.danger {
+  color: var(--danger);
+}
+
+/* long-press drag ghost (touch) */
+.drag-ghost {
+  position: fixed;
+  z-index: 200;
+  pointer-events: none;
+  transform: translate(-50%, -140%);
+  background: var(--accent2);
+  color: #fff;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  max-width: 240px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* tags */

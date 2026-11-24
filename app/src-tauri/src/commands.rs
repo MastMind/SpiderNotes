@@ -1,6 +1,9 @@
+use crate::server_sync::restart_server_sync;
 use crate::state::{persist_peers, AppState, MDNS_REFRESH_SECS, PUSH_DEBOUNCE_MS};
 use spidernotes_core::{Note, NoteSummary, Vault};
-use spidernotes_p2p::agent::{sync_initiator, sync_responder, SyncReport as P2pSyncReport};
+use spidernotes_p2p::agent::{
+    capped_initiator, capped_responder, is_busy_error, SyncReport as P2pSyncReport,
+};
 use spidernotes_p2p::discovery::{Discovery, PeerEvent, PeerInfo};
 use spidernotes_p2p::transport::SyncListener;
 use std::net::SocketAddr;
@@ -19,6 +22,8 @@ pub struct OpenResult {
     pub device_name: String,
     pub notes: Vec<NoteSummary>,
     pub peers: Vec<PeerInfo>,
+    /// Vault folders (relative slash-separated paths), including empty ones.
+    pub folders: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -36,6 +41,19 @@ pub struct P2pSettings {
     /// Desired port, applied on (re)start of P2P.
     pub p2p_port_setting: u16,
     pub p2p_running: bool,
+}
+
+/// Relay-server state for the UI. The secret is intentionally never
+/// returned: it only travels frontend -> backend.
+#[derive(serde::Serialize)]
+pub struct ServerSyncStatus {
+    pub enabled: bool,
+    pub connected: bool,
+    pub host: String,
+    pub port: u16,
+    pub room: String,
+    pub peer_count: usize,
+    pub status: String,
 }
 
 #[derive(serde::Serialize)]
@@ -77,62 +95,113 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hard cap on a full sync exchange. Without it a half-open connection
 /// (peer accepts TCP but never speaks) would hold `sync_gate` forever and
 /// freeze every save/delete/rename behind it.
-const SYNC_PROTOCOL_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const SYNC_PROTOCOL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Push the merged peer view (mDNS + relay) to the UI.
+pub fn emit_peers(app: &AppHandle, st: &AppState) {
+    let _ = app.emit("peers-updated", st.merged_peers());
+}
 
 /// Update the peer cache and the UI. Only a NON-EMPTY mDNS view replaces the
 /// cache: a freshly (re)created daemon starts empty and would otherwise wipe
 /// the restored (persisted) peers before it re-discovers them. The UI always
-/// gets the real mDNS view through the event, whatever the cache holds.
+/// gets the merged view (mDNS + relay) through the event.
 fn broadcast_peers(app: &AppHandle, st: &AppState, peers: &[PeerInfo]) {
     if !peers.is_empty() {
         *st.peers_cache.lock().unwrap() = peers.to_vec();
         persist_peers(&st.peers_path, peers);
     }
-    let _ = app.emit("peers-updated", peers.to_vec());
+    emit_peers(app, st);
 }
 
-/// Connect to each *trusted* peer and run the initiator-side sync on the vault.
+/// Connect to each *trusted* peer and run the initiator-side sync.
 /// Untrusted peers are skipped (and logged) so notes never leave for unknown devices.
-/// Caller must hold `st.sync_gate`.
+///
+/// Gate discipline: the sync gate is taken per attempt and RELEASED during
+/// busy-retry waits. Holding it while waiting would make our own retry hit
+/// the peer's still-held gate (and vice versa) — a collision chain that
+/// keeps both devices diverged for a whole autosync period.
 async fn sync_vault_with_peers(
     st: &AppState,
     app: &AppHandle,
-    vault: &mut Vault,
+    vault: &Arc<Mutex<Option<Vault>>>,
     peers: &[PeerInfo],
 ) -> Vec<P2pSyncReport> {
-    if let Err(e) = vault.scan_and_repair() {
-        tracing::warn!("pre-sync scan: {e}");
-    }
     let mut out = Vec::new();
     for p in peers {
         if !st.trust.is_trusted(&p.device_id) {
             tracing::debug!("sync: skipping untrusted peer {} ({})", p.name, p.device_id);
             continue;
         }
-        let Some(addr) = parse_peer_addr(&p.address, p.port) else {
-            tracing::warn!("sync: bad address for {}: {}", p.name, p.address);
-            continue;
-        };
-        let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                tracing::warn!("sync: cannot reach {}: {e}", p.name);
-                continue;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let _gate = st.sync_gate.lock().await;
+            let Some(mut v) = vault.lock().unwrap().clone() else {
+                tracing::warn!("sync: no vault is open");
+                break;
+            };
+            if let Err(e) = v.scan_and_repair() {
+                tracing::warn!("pre-sync scan: {e}");
             }
-            Err(_) => {
-                tracing::warn!("sync: connect timeout for {} ({addr})", p.name);
-                continue;
+            // Relay peers: no direct route, the sync protocol runs over a
+            // relay session stream (same frames, end-to-end encrypted).
+            let res = if p.via_server {
+                let handle = st.server_handle.lock().unwrap().clone();
+                let Some(stream) = handle.and_then(|h| h.open_session(&p.device_id)) else {
+                    tracing::warn!("sync: relay not connected, skipping {}", p.name);
+                    break;
+                };
+                capped_initiator(stream, &st.identity, p.x25519_pub, &mut v, SYNC_PROTOCOL_TIMEOUT)
+                    .await
+            } else {
+                let Some(addr) = parse_peer_addr(&p.address, p.port) else {
+                    tracing::warn!("sync: bad address for {}: {}", p.name, p.address);
+                    break;
+                };
+                let stream =
+                    match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            tracing::warn!("sync: cannot reach {}: {e}", p.name);
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::warn!("sync: connect timeout for {} ({addr})", p.name);
+                            break;
+                        }
+                    };
+                capped_initiator(stream, &st.identity, p.x25519_pub, &mut v, SYNC_PROTOCOL_TIMEOUT)
+                    .await
+            };
+            match res {
+                Ok(r) => {
+                    st.put_vault(v);
+                    out.push(r);
+                    break;
+                }
+                Err(e) if p.via_server && is_busy_error(&e) && attempt <= 2 => {
+                    // The peer is mid-sync with someone else and answered
+                    // fast with "busy": release the gate, wait a staggered
+                    // (and increasing) moment, retry. With the gate free
+                    // during the wait, the staggered retries break the
+                    // symmetry even when both devices retry at the same
+                    // instant.
+                    drop(_gate);
+                    tracing::info!(
+                        "sync: {} (via server) busy, attempt {attempt}/3",
+                        p.name
+                    );
+                    tokio::time::sleep(Duration::from_millis(
+                        1000 * attempt + rand::random::<u16>() as u64 % 1000,
+                    ))
+                    .await;
+                }
+                Err(e) => {
+                    tracing::warn!("sync: {} failed: {e}", p.name);
+                    break;
+                }
             }
-        };
-        match tokio::time::timeout(
-            SYNC_PROTOCOL_TIMEOUT,
-            sync_initiator(stream, &st.identity, p.x25519_pub, vault),
-        )
-        .await
-        {
-            Ok(Ok(r)) => out.push(r),
-            Ok(Err(e)) => tracing::warn!("sync: {} failed: {e}", p.name),
-            Err(_) => tracing::warn!("sync: {} timed out after {SYNC_PROTOCOL_TIMEOUT:?}", p.name),
         }
     }
     if !out.is_empty() {
@@ -142,16 +211,18 @@ async fn sync_vault_with_peers(
 }
 
 /// Fire-and-forget background sync (auto-sync timer / peer-joined trigger).
-fn spawn_auto_sync(app: AppHandle, st: AppState, peers: Vec<PeerInfo>) {
+pub fn spawn_auto_sync(app: AppHandle, st: AppState, peers: Vec<PeerInfo>) {
     if peers.is_empty() {
         return;
     }
     tauri::async_runtime::spawn(async move {
-        let _gate = st.sync_gate.lock().await;
-        let Some(mut vault) = st.vault.lock().unwrap().clone() else {
-            return;
-        };
-        let reports = sync_vault_with_peers(&st, &app, &mut vault, &peers).await;
+        // Random 0-1.5s stagger: when both devices trigger at the same
+        // instant (the same roster broadcast reaches both, or the timers
+        // are aligned) both would become initiators and reject each other's
+        // sessions. The stagger lets one side answer as the responder.
+        let jitter = Duration::from_millis((rand::random::<u16>() % 1500) as u64);
+        tokio::time::sleep(jitter).await;
+        let reports = sync_vault_with_peers(&st, &app, &st.vault, &peers).await;
         for r in &reports {
             tracing::info!(
                 "auto-sync {}: sent {}, applied {}, skipped {}",
@@ -161,7 +232,6 @@ fn spawn_auto_sync(app: AppHandle, st: AppState, peers: Vec<PeerInfo>) {
                 r.skipped
             );
         }
-        st.put_vault(vault);
     });
 }
 
@@ -179,18 +249,17 @@ fn schedule_push(app: AppHandle, st: AppState) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(PUSH_DEBOUNCE_MS)).await;
-            // Snapshot the change count *before* cloning the vault: any change
-            // with seq <= `before` is guaranteed to be inside the cloned vault.
+            // Snapshot the change count *before* the sync clones the vault
+            // (the clone happens inside sync_vault_with_peers, after this
+            // read): any change with seq <= `before` is guaranteed to be
+            // inside the cloned vault.
             let before = st.change_seq.load(Ordering::SeqCst);
-            let Some(mut vault) = st.vault.lock().unwrap().clone() else {
+            if st.vault.lock().unwrap().is_none() {
                 st.push_pending.store(false, Ordering::SeqCst);
                 return;
-            };
-            let _gate = st.sync_gate.lock().await;
-            let peers = st.peers_cache.lock().unwrap().clone();
-            let reports = sync_vault_with_peers(&st, &app, &mut vault, &peers).await;
-            st.put_vault(vault);
-            drop(_gate);
+            }
+            let peers = st.merged_peers();
+            let reports = sync_vault_with_peers(&st, &app, &st.vault, &peers).await;
             let _ = app.emit("notes-changed", ());
             for r in &reports {
                 tracing::info!(
@@ -290,13 +359,10 @@ fn start_p2p(
             if let Err(e) = vault.scan_and_repair() {
                 tracing::warn!("pre-sync scan: {e}");
             }
-            match tokio::time::timeout(
-                SYNC_PROTOCOL_TIMEOUT,
-                sync_responder(stream, &identity, &mut vault, &trust_r),
-            )
-            .await
+            match capped_responder(stream, &identity, &mut vault, &trust_r, SYNC_PROTOCOL_TIMEOUT)
+                .await
             {
-                Ok(Ok(report)) => {
+                Ok(report) => {
                     tracing::info!(
                         "P2P sync with {}: sent {}, applied {}, skipped {}",
                         report.peer_name,
@@ -307,8 +373,7 @@ fn start_p2p(
                     *vaults_r.lock().unwrap() = Some(vault);
                     let _ = app_r.emit("notes-changed", ());
                 }
-                Ok(Err(e)) => tracing::warn!("P2P sync failed: {e}"),
-                Err(_) => tracing::warn!("P2P sync: protocol timed out after {SYNC_PROTOCOL_TIMEOUT:?}"),
+                Err(e) => tracing::warn!("P2P sync failed: {e}"),
             }
         }
     });
@@ -337,6 +402,21 @@ fn start_p2p(
             tokio::select! {
                 _ = stop_disc.changed() => break,
                 _ = refresh_tick.tick() => {
+                    // The daemon now running has had a full cycle (~60s) to
+                    // re-discover live peers. If it saw nothing while the
+                    // cache is non-empty, the cached mDNS peers left the
+                    // subnet: drop them. An empty view never replaces the
+                    // cache by itself, so a stale direct entry would
+                    // otherwise survive forever and shadow the relay entry
+                    // for the same device in merged_peers (syncs would then
+                    // target a dead address instead of the relay).
+                    let fresh = discovery.peers();
+                    if fresh.is_empty() && !peers_cache.lock().unwrap().is_empty() {
+                        tracing::info!("mDNS: no peers seen for a full cycle — dropping stale cached peers");
+                        *peers_cache.lock().unwrap() = Vec::new();
+                        persist_peers(&st_d.peers_path, &[]);
+                        broadcast_peers(&app_d, &st_d, &fresh);
+                    }
                     // Recreate the mDNS daemon on the static schedule: a
                     // fresh daemon sends a new PTR query (a late peer's
                     // one-shot announce can be lost on Wi-Fi) and
@@ -391,7 +471,7 @@ fn start_p2p(
                 _ = stop_tick.changed() => break,
                 _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
             }
-            let peers = st_t.peers_cache.lock().unwrap().clone();
+            let peers = st_t.merged_peers();
             spawn_auto_sync(app_t.clone(), st_t.clone(), peers);
         }
     });
@@ -430,8 +510,9 @@ pub async fn do_open_vault(
         tracing::warn!("vault scan: {e}");
     }
     let notes = vault.live_notes();
+    let folders = vault.list_folders();
     let root = vault.root().to_string_lossy().to_string();
-    let peers = st.peers_cache.lock().unwrap().clone();
+    let peers = st.merged_peers();
     st.put_vault(vault);
     Ok(OpenResult {
         path: root,
@@ -440,6 +521,7 @@ pub async fn do_open_vault(
         device_name: st.identity.name.clone(),
         notes,
         peers,
+        folders,
     })
 }
 
@@ -481,7 +563,7 @@ pub fn vault_status(app: AppHandle) -> Result<Option<OpenResult>, String> {
         let Some(v) = guard.as_ref() else {
             return Ok(None);
         };
-        let peers = st.peers_cache.lock().unwrap().clone();
+        let peers = st.merged_peers();
         Ok(Some(OpenResult {
             path: v.root().to_string_lossy().to_string(),
             p2p_port: st.p2p_port.load(Ordering::SeqCst),
@@ -489,6 +571,7 @@ pub fn vault_status(app: AppHandle) -> Result<Option<OpenResult>, String> {
             device_name: st.identity.name.clone(),
             notes: v.live_notes(),
             peers,
+            folders: v.list_folders(),
         }))
     }
 }
@@ -560,6 +643,55 @@ pub async fn rename_note(
 }
 
 #[tauri::command]
+pub fn list_folders(app: AppHandle) -> Result<Vec<String>, String> {
+    let st = (*app.state::<AppState>()).clone();
+    Ok(vault_or_err(&st)?.list_folders())
+}
+
+/// Create a folder. Empty folders are local-only (folders have no index
+/// entries, so nothing to push); the gate still serializes with in-flight
+/// syncs' pre-sync scans.
+#[tauri::command]
+pub async fn create_folder(app: AppHandle, path: String) -> Result<String, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let _gate = st.sync_gate.lock().await;
+    let mut v = vault_or_err(&st)?;
+    let p = v.create_folder(&path).map_err(|e| e.to_string())?;
+    st.put_vault(v);
+    Ok(p)
+}
+
+#[tauri::command]
+pub async fn rename_folder(
+    app: AppHandle,
+    old_path: String,
+    new_path: String,
+) -> Result<usize, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let _gate = st.sync_gate.lock().await;
+    let mut v = vault_or_err(&st)?;
+    let n = v
+        .rename_folder(&old_path, &new_path)
+        .map_err(|e| e.to_string())?;
+    st.put_vault(v);
+    // moved notes got fresh HLCs: push them like any edit
+    schedule_push(app, st.clone());
+    Ok(n)
+}
+
+#[tauri::command]
+pub async fn delete_folder(app: AppHandle, path: String) -> Result<Vec<NoteSummary>, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let _gate = st.sync_gate.lock().await;
+    let mut v = vault_or_err(&st)?;
+    let deleted = v.delete_folder(&path).map_err(|e| e.to_string())?;
+    st.put_vault(v);
+    // tombstones must reach the peers
+    schedule_push(app, st.clone());
+    Ok(deleted)
+}
+
+#[tauri::command]
 pub fn search_notes(app: AppHandle, query: String) -> Result<Vec<NoteSummary>, String> {
     let st = (*app.state::<AppState>()).clone();
     Ok(vault_or_err(&st)?.search(&query))
@@ -616,7 +748,7 @@ pub fn device_info(app: AppHandle) -> Result<DeviceInfo, String> {
 #[tauri::command]
  pub fn list_peers(app: AppHandle) -> Result<Vec<PeerInfo>, String> {
     let st = (*app.state::<AppState>()).clone();
-    let peers = st.peers_cache.lock().unwrap().clone();
+    let peers = st.merged_peers();
     Ok(peers)
  }
 
@@ -633,12 +765,15 @@ pub fn device_info(app: AppHandle) -> Result<DeviceInfo, String> {
     name: String,
 ) -> Result<Vec<spidernotes_core::TrustedDevice>, String> {
     let st = (*app.state::<AppState>()).clone();
-     if let Err(e) = st.trust.add(&device_id, &name) {
-         tracing::error!("trust_device failed for {} ({}): {e}", name, device_id);
-         return Err(format!("cannot save trust list: {e}"));
-     }
-     tracing::info!("trusted device {} ({})", name, device_id);
-     Ok(st.trust.list())
+     if device_id == st.identity.id {
+          return Err("that is this device — trust the OTHER device's id instead".into());
+      }
+      if let Err(e) = st.trust.add(&device_id, &name) {
+          tracing::error!("trust_device failed for {} ({}): {e}", name, device_id);
+          return Err(format!("cannot save trust list: {e}"));
+      }
+      tracing::info!("trusted device {} ({})", name, device_id);
+      Ok(st.trust.list())
   }
 
  #[tauri::command]
@@ -712,7 +847,7 @@ pub fn set_p2p_port_setting(app: AppHandle, port: u16) -> Result<u16, String> {
 /// Android, backgrounding kills the multicast socket, so the daemon must be
 /// rebuilt before peers (and with them sync) come back.
 #[tauri::command]
-pub fn mdns_refresh(app: AppHandle) -> Result<(), String> {
+ pub fn mdns_refresh(app: AppHandle) -> Result<(), String> {
     let st = (*app.state::<AppState>()).clone();
     if !st.p2p_running.load(Ordering::SeqCst) {
         return Ok(()); // nothing to refresh; P2P not started
@@ -720,7 +855,77 @@ pub fn mdns_refresh(app: AppHandle) -> Result<(), String> {
     let next = *st.mdns_refresh_tx.borrow() + 1;
     let _ = st.mdns_refresh_tx.send_replace(next);
     Ok(())
-}
+ }
+
+ /// Enable/disable (or reconfigure) the relay server. With `enabled = false`
+ /// the relay loop is stopped and the room peers are cleared.
+ #[tauri::command]
+ pub async fn set_server_sync(
+    app: AppHandle,
+    enabled: bool,
+    host: String,
+    port: u16,
+    room: String,
+    secret: String,
+ ) -> Result<ServerSyncStatus, String> {
+    let st = (*app.state::<AppState>()).clone();
+    if enabled {
+        if host.trim().is_empty() {
+            return Err("server host is empty".into());
+        }
+        if port == 0 {
+            return Err("server port is 0".into());
+        }
+        if room.trim().is_empty() {
+            return Err("room id is empty".into());
+        }
+        if secret.trim().is_empty() {
+            return Err("secret is empty".into());
+        }
+        *st.server_cfg.lock().unwrap() = Some(crate::state::ServerCfg {
+            host: host.trim().to_string(),
+            port,
+            room: room.trim().to_string(),
+            secret,
+        });
+    } else {
+        *st.server_cfg.lock().unwrap() = None;
+    }
+    restart_server_sync(app.clone(), &st);
+    Ok(server_sync_status_inner(&st))
+ }
+
+ fn server_sync_status_inner(st: &AppState) -> ServerSyncStatus {
+    let cfg = st.server_cfg.lock().unwrap().clone();
+    let connected = st.server_handle.lock().unwrap().as_ref().is_some_and(|h| h.connected());
+    let peer_count = st.server_peers.lock().unwrap().len();
+    match cfg {
+        Some(c) => ServerSyncStatus {
+            enabled: true,
+            connected,
+            host: c.host,
+            port: c.port,
+            room: c.room,
+            peer_count,
+            status: st.server_status.lock().unwrap().clone(),
+        },
+        None => ServerSyncStatus {
+            enabled: false,
+            connected: false,
+            host: String::new(),
+            port: 0,
+            room: String::new(),
+            peer_count: 0,
+            status: st.server_status.lock().unwrap().clone(),
+        },
+    }
+ }
+
+ #[tauri::command]
+ pub fn server_sync_status(app: AppHandle) -> ServerSyncStatus {
+    let st = (*app.state::<AppState>()).clone();
+    server_sync_status_inner(&st)
+ }
 
 #[tauri::command]
 pub async fn restart_p2p(app: AppHandle) -> Result<u16, String> {
@@ -764,30 +969,61 @@ pub async fn sync_with(app: AppHandle, peer: PeerInfo) -> Result<P2pSyncReport, 
             peer.name
         ));
     }
-    let _gate = st.sync_gate.lock().await;
-    let mut v = vault_or_err(&st)?;
-    let addr = parse_peer_addr(&peer.address, peer.port)
-        .ok_or_else(|| format!("bad address for {}: {}", peer.name, peer.address))?;
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|_| format!("connect timeout to {addr}"))?
-        .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
-    let report = sync_initiator(stream, &st.identity, peer.x25519_pub, &mut v)
-        .await
-        .map_err(|e| format!("sync failed: {e}"))?;
-    st.put_vault(v);
-    let _ = app.emit("notes-changed", ());
-    Ok(report)
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let _gate = st.sync_gate.lock().await;
+        let mut v = vault_or_err(&st)?;
+        let res = if peer.via_server {
+            let handle = st.server_handle.lock().unwrap().clone();
+            let stream = handle
+                .and_then(|h| h.open_session(&peer.device_id))
+                .ok_or_else(|| "relay server is not connected".to_string())?;
+            capped_initiator(stream, &st.identity, peer.x25519_pub, &mut v, SYNC_PROTOCOL_TIMEOUT)
+                .await
+        } else {
+            let addr = parse_peer_addr(&peer.address, peer.port)
+                .ok_or_else(|| format!("bad address for {}: {}", peer.name, peer.address))?;
+            let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+                .await
+                .map_err(|_| format!("connect timeout to {addr}"))?
+                .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
+            capped_initiator(stream, &st.identity, peer.x25519_pub, &mut v, SYNC_PROTOCOL_TIMEOUT)
+                .await
+        };
+        match res {
+            Ok(r) => {
+                st.put_vault(v);
+                let _ = app.emit("notes-changed", ());
+                return Ok(r);
+            }
+            // The peer is mid-sync with someone else and answered fast with
+            // a "busy" error — release the gate, wait a staggered moment and
+            // retry instead of surfacing the error (bounded: 3 attempts
+            // total).
+            Err(e) if is_busy_error(&e) && attempt < 3 => {
+                drop(_gate);
+                tracing::info!(
+                    "sync: {} is busy, attempt {attempt}/3 in ~{}s",
+                    peer.name,
+                    attempt
+                );
+                tokio::time::sleep(
+                    Duration::from_secs(attempt as u64)
+                        + Duration::from_millis(rand::random::<u16>() as u64 % 1000),
+                )
+                .await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 #[tauri::command]
 pub async fn sync_all(app: AppHandle) -> Result<Vec<P2pSyncReport>, String> {
     let st = (*app.state::<AppState>()).clone();
-    let _gate = st.sync_gate.lock().await;
-    let mut v = vault_or_err(&st)?;
-    let peers = st.peers_cache.lock().unwrap().clone();
-    let out = sync_vault_with_peers(&st, &app, &mut v, &peers).await;
-    st.put_vault(v);
+    let peers = st.merged_peers();
+    let out = sync_vault_with_peers(&st, &app, &st.vault, &peers).await;
     Ok(out)
 }
 

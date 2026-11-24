@@ -15,9 +15,14 @@ pub struct PeerInfo {
     pub name: String,
     pub device_id: String,
     pub x25519_pub: [u8; 32],
-    /// One of the peer's addresses (first known).
+    /// One of the peer's addresses (first known); empty when the peer is
+    /// reached through the relay server (no direct route).
     pub address: String,
     pub port: u16,
+    /// Discovered through the relay server instead of mDNS (no direct
+    /// address; sync runs over the relay session).
+    #[serde(default)]
+    pub via_server: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +221,7 @@ impl Discovery {
                 x25519_pub: arr,
                 address,
                 port: info.get_port(),
+                via_server: false,
             },
         ))
     }

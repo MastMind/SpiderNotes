@@ -78,8 +78,12 @@ window.__TAURI_INTERNALS__ = {
       case "vault_status": return null;
       case "default_vault_path": return "/mock/vault";
       case "open_vault":
-        return { path: "/mock/vault", p2p_port: 8788, device_id: "localdev", device_name: "mock", notes: window.__mockNotesList, peers: [] };
+        return { path: "/mock/vault", p2p_port: 8788, device_id: "localdev", device_name: "mock", notes: window.__mockNotesList, peers: [], folders: [] };
       case "list_notes": return window.__mockNotesList;
+      case "list_folders": return [];
+      case "create_folder": return args.path;
+      case "rename_folder": return 0;
+      case "delete_folder": return [];
       case "read_note": {
         const n = window.__mockNotes[args.uuid];
         if (!n) throw new Error("unknown note " + args.uuid);

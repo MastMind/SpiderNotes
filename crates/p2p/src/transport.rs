@@ -8,8 +8,9 @@ use noise_protocol::{CipherState, HandshakeState, U8Array};
 use noise_rust_crypto::sensitive::Sensitive;
 use noise_rust_crypto::{ChaCha20Poly1305, Sha256, X25519};
 use spidernotes_core::DeviceIdentity;
+use std::marker::Unpin;
 use std::net::SocketAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 type HS = HandshakeState<X25519, ChaCha20Poly1305, Sha256>;
@@ -29,13 +30,16 @@ pub fn xk_pattern() -> HandshakePattern {
     )
 }
 
-pub struct SecureStream {
-    stream: TcpStream,
+/// An authenticated, encrypted frame stream. Generic over the byte source
+/// so the same handshake/frames can run over a TCP socket OR a relay
+/// session stream (server-mediated sync).
+pub struct SecureStream<S> {
+    stream: S,
     to: Ciph,
     from: Ciph,
 }
 
-impl SecureStream {
+impl SecureStream<TcpStream> {
     pub async fn connect(
         addr: SocketAddr,
         identity: &DeviceIdentity,
@@ -44,10 +48,15 @@ impl SecureStream {
         let stream = TcpStream::connect(addr).await?;
         Self::initiator(stream, identity, remote_pub).await
     }
+}
 
+impl<S> SecureStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     /// Run the initiator side of the handshake on an already-connected stream.
     pub async fn initiator(
-        mut stream: TcpStream,
+        mut stream: S,
         identity: &DeviceIdentity,
         remote_pub: [u8; 32],
     ) -> anyhow::Result<Self> {
@@ -83,7 +92,7 @@ impl SecureStream {
         Ok(Self { stream, to, from })
     }
 
-    pub async fn accept(mut stream: TcpStream, identity: &DeviceIdentity) -> anyhow::Result<Self> {
+    pub async fn accept(mut stream: S, identity: &DeviceIdentity) -> anyhow::Result<Self> {
         let static_key: Sensitive<[u8; 32]> =
             Sensitive::from_slice(&identity.x25519_seed_bytes());
         let mut hs: HS = HandshakeState::new(
@@ -138,6 +147,7 @@ impl SecureStream {
         Ok(pt)
     }
 
+    /// Close the write half (works for TCP and relay streams alike).
     pub async fn shutdown(mut self) -> std::io::Result<()> {
         self.stream.shutdown().await
     }
