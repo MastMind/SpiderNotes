@@ -5,6 +5,7 @@ import type { Backlink, NoteSummary, OpenResult, PeerInfo, TagCount } from "./ty
 import { Editor } from "./Editor";
 import { NotesTree } from "./NotesTree";
 import { PeersPanel } from "./PeersPanel";
+import { THEMES } from "./themes";
 
 function GearIcon() {
   return (
@@ -66,9 +67,19 @@ export default function App() {
   const [live, setLive] = useState(
     () => localStorage.getItem("sn.live") !== "0",
   );
-  // UI theme; "dark" is the default
-  const [theme, setTheme] = useState<"dark" | "light">(() =>
-    localStorage.getItem("sn.theme") === "light" ? "light" : "dark",
+  // UI theme id (see THEMES in themes.ts); "dark" is the default.
+  const [theme, setTheme] = useState<string>(() => {
+    const t = localStorage.getItem("sn.theme");
+    return THEMES.some((x) => x.id === t) ? (t as string) : "dark";
+  });
+  // UI font size in px (design setting; 12..18, default 14).
+  const [fontSize, setFontSize] = useState<number>(() => {
+    const n = parseInt(localStorage.getItem("sn.fontSize") || "", 10);
+    return Number.isFinite(n) && n >= 12 && n <= 18 ? n : 14;
+  });
+  // Editor line-number gutter (design setting; on by default).
+  const [lineNumbers, setLineNumbers] = useState<boolean>(
+    () => localStorage.getItem("sn.lineNumbers") !== "0",
   );
   // Autosave delay in seconds (frontend-only setting; default 2s).
   const [autosaveSecs, setAutosaveSecs] = useState(() => {
@@ -229,6 +240,16 @@ export default function App() {
     localStorage.setItem("sn.theme", theme);
     document.documentElement.dataset.theme = theme;
   }, [theme]);
+
+  // Font size: the whole UI scales from --ui-fs (styles.css).
+  useEffect(() => {
+    localStorage.setItem("sn.fontSize", String(fontSize));
+    document.documentElement.style.setProperty("--ui-fs", `${fontSize}px`);
+  }, [fontSize]);
+
+  useEffect(() => {
+    localStorage.setItem("sn.lineNumbers", lineNumbers ? "1" : "0");
+  }, [lineNumbers]);
 
   // Edge swipes (touch): from the screen's left edge, swipe RIGHT to open
   // the notes list; from within the open list, swipe LEFT to close it.
@@ -724,9 +745,10 @@ export default function App() {
       </header>
 
       <div className="body">
-        {showSidebar && (
+        {/* Always mounted: the .open class drives the slide-in/out
+            transition (unmounting would kill the closing animation). */}
         <aside
-          className="sidebar"
+          className={showSidebar ? "sidebar open" : "sidebar"}
           onContextMenu={(e) => {
             // Notes/folders have their own menus (stopPropagation), inputs
             // keep the native one (copy/paste); anywhere else in the panel
@@ -744,6 +766,16 @@ export default function App() {
             );
           }}
         >
+          {/* Mobile only: on narrow screens the sidebar is a full-screen
+              overlay, so it needs its own close button (the rail is
+              covered). */}
+          <button
+            className="close-sidebar"
+            title="Close notes list"
+            onClick={() => setShowSidebar(false)}
+          >
+            ✕
+          </button>
           <div className="pad">
             <input
               className="inp"
@@ -839,7 +871,6 @@ export default function App() {
             </div>
           )}
         </aside>
-        )}
 
         <main className="main">
           {/* Always-visible rail: hides/shows the notes list. Sits next to
@@ -874,6 +905,7 @@ export default function App() {
                 notes={notes}
                 live={live}
                 theme={theme}
+                lineNumbers={lineNumbers}
                 onOpenNote={openWikiTarget}
                 onOpenTag={openTag}
               />
@@ -905,6 +937,10 @@ export default function App() {
             log={log}
             theme={theme}
             onTheme={setTheme}
+            fontSize={fontSize}
+            onFontSize={setFontSize}
+            lineNumbers={lineNumbers}
+            onLineNumbers={setLineNumbers}
             onClose={() => setShowNet(false)}
           />
         )}

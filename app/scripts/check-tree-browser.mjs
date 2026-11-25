@@ -435,8 +435,13 @@ const closed = await evalJs(`(() => {
 })()`);
 void closed;
 await sleep(300);
-const sidebarAfterClose = await evalJs(`!!document.querySelector(".sidebar")`);
-check("swipe left in sidebar closes it", closed === true && !sidebarAfterClose, `sidebar=${sidebarAfterClose}`);
+const sidebarAfterClose = await evalJs(`(() => {
+  const s = document.querySelector(".sidebar");
+  if (!s) return true; // legacy: unmounted
+  const r = s.getBoundingClientRect();
+  return r.right <= 1 && getComputedStyle(s).opacity === "0";
+})()`);
+check("swipe left in sidebar closes it (slides off-screen)", closed === true && sidebarAfterClose, `sidebar=${JSON.stringify(sidebarAfterClose)}`);
 
 const openedSwipe = await evalJs(`(() => {
   const target = document.elementFromPoint(5, 300) || document.body;
@@ -448,8 +453,13 @@ const openedSwipe = await evalJs(`(() => {
 })()`);
 void openedSwipe;
 await sleep(300);
-const sidebarAfterOpen = await evalJs(`!!document.querySelector(".sidebar")`);
-check("swipe right from left edge opens it", openedSwipe === true && sidebarAfterOpen, `sidebar=${sidebarAfterOpen}`);
+const sidebarAfterOpen = await evalJs(`(() => {
+  const s = document.querySelector(".sidebar");
+  if (!s) return false;
+  const r = s.getBoundingClientRect();
+  return r.left === 0 && getComputedStyle(s).opacity === "1";
+})()`);
+check("swipe right from left edge opens it (slides back in)", openedSwipe === true && sidebarAfterOpen, `sidebar=${JSON.stringify(sidebarAfterOpen)}`);
 
 console.log("\n=== EXCEPTIONS ===");
 if (exceptions.length) {

@@ -7,7 +7,7 @@ import {
   highlightActiveLine,
   highlightActiveLineGutter,
   keymap,
-  lineNumbers,
+  lineNumbers as lineNumbersExt,
 } from "@codemirror/view";
 import {
   defaultKeymap,
@@ -31,6 +31,7 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import { oneDark } from "@codemirror/theme-one-dark";
 import type { NoteSummary } from "./types";
+import { themeById } from "./themes";
 import { liveField, livePreviewExtensions, toggleLive } from "./livePreview";
 
 function wikilinkSource(getNotes: () => NoteSummary[]) {
@@ -74,6 +75,7 @@ export function Editor({
   notes,
   live,
   theme,
+  lineNumbers,
   onOpenNote,
   onOpenTag,
 }: {
@@ -81,13 +83,17 @@ export function Editor({
   onDoc: (s: string) => void;
   notes: NoteSummary[];
   live: boolean;
-  theme: "dark" | "light";
+  /** Theme id from THEMES (themes.ts) — the editor needs only its mode. */
+  theme: string;
+  /** Show the line-number gutter (design setting, default on). */
+  lineNumbers: boolean;
   onOpenNote?: (target: string) => void;
   onOpenTag?: (tag: string) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const themeComp = useRef(new Compartment());
+  const lineNumComp = useRef(new Compartment());
   const onDocRef = useRef(onDoc);
   onDocRef.current = onDoc;
   const notesRef = useRef(notes);
@@ -102,7 +108,12 @@ export function Editor({
     const state = EditorState.create({
       doc,
       extensions: [
-        lineNumbers(),
+        // Line numbers behind a compartment: the gutter is a design
+        // setting and can be toggled without recreating the view.
+        lineNumComp.current.of(lineNumbers ? lineNumbersExt() : []),
+        // Wrap long lines to the editor's width: the editor always stays
+        // full-width (no horizontal scroll at any window size).
+        EditorView.lineWrapping,
         highlightActiveLine(),
         highlightActiveLineGutter(),
         history(),
@@ -155,13 +166,19 @@ export function Editor({
           indentWithTab,
         ]),
         markdown({ base: markdownLanguage, codeLanguages: languages }),
-        themeComp.current.of(theme === "dark" ? oneDark : []),
+        themeComp.current.of(themeById(theme).dark ? oneDark : []),
         EditorView.updateListener.of((u) => {
           if (u.docChanged) onDocRef.current(u.state.doc.toString());
         }),
         EditorView.theme({
           "&": { height: "100%" },
-          ".cm-scroller": { overflow: "auto" },
+          // Monospace everywhere (the app's UI font is monospace too) —
+          // a nicer stack than the bare `monospace` keyword.
+          ".cm-scroller": {
+            overflow: "auto",
+            fontFamily:
+              'ui-monospace, "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace',
+          },
         }),
       ],
     });
@@ -194,14 +211,25 @@ export function Editor({
     }
   }, [live]);
 
-  // Switch the editor theme (oneDark <-> default light).
+  // Switch the editor theme (oneDark for dark themes, default light otherwise).
   useEffect(() => {
     const v = viewRef.current;
     if (!v) return;
     v.dispatch({
-      effects: themeComp.current.reconfigure(theme === "dark" ? oneDark : []),
+      effects: themeComp.current.reconfigure(themeById(theme).dark ? oneDark : []),
     });
   }, [theme]);
+
+  // Line-number gutter on/off (design setting).
+  useEffect(() => {
+    const v = viewRef.current;
+    if (!v) return;
+    v.dispatch({
+      effects: lineNumComp.current.reconfigure(
+        lineNumbers ? lineNumbersExt() : [],
+      ),
+    });
+  }, [lineNumbers]);
 
   return (
     <div ref={ref} className={`editor${live ? "" : " md-raw"}`} />

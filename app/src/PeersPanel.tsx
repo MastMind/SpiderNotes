@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import * as api from "./api";
 import type { PeerInfo, TrustedDevice } from "./types";
+import { THEMES } from "./themes";
 
 // Background sync (the Android foreground service) only exists on Android;
 // hide its toggle everywhere else. Tauri's Android webview is Chromium, so
@@ -51,8 +52,12 @@ export function PeersPanel(props: {
   vaultPath: string;
   onLog?: (m: string) => void;
   log: string[];
-  theme: "dark" | "light";
-  onTheme: (t: "dark" | "light") => void;
+  theme: string;
+  onTheme: (t: string) => void;
+  fontSize: number;
+  onFontSize: (n: number) => void;
+  lineNumbers: boolean;
+  onLineNumbers: (b: boolean) => void;
   onClose?: () => void;
 }) {
   const logRef = useRef<HTMLDivElement>(null);
@@ -88,6 +93,17 @@ export function PeersPanel(props: {
   // In-app confirmation (window.confirm in the webview is unreliable: the
   // native dialog can close without the result reaching the JS).
   const [confirmPeer, setConfirmPeer] = useState<PeerInfo | null>(null);
+  // Design section: hidden until its button is pressed; font size keeps a
+  // draft like the other number inputs (applied on blur / Enter).
+  const [showDesign, setShowDesign] = useState(false);
+  const [fontSizeDraft, setFontSizeDraft] = useState(props.fontSize);
+
+  const applyFontSize = () => {
+    const n = Math.max(12, Math.min(18, Math.round(fontSizeDraft) || 14));
+    setFontSizeDraft(n);
+    props.onFontSize(n);
+    props.onLog?.(`font size: ${n}px`);
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -349,19 +365,63 @@ export function PeersPanel(props: {
         })}
       </div>
 
+     <h2>Visual</h2>
+      <div className="pad">
+        <button
+          className="wide"
+          onClick={() => setShowDesign((v) => !v)}
+        >
+          {showDesign ? "Hide visual settings" : "Visual settings"}
+        </button>
+        {showDesign && (
+          <div className="design-body">
+            <label className="adv-row">
+              <span>Theme</span>
+              <select
+                className="inp sel"
+                value={props.theme}
+                onChange={(e) => {
+                  props.onTheme(e.target.value);
+                  props.onLog?.(`theme: ${e.target.value}`);
+                }}
+              >
+                {THEMES.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="adv-row">
+              <span>Font size, px</span>
+              <input
+                className="inp num"
+                type="number"
+                min={12}
+                max={18}
+                value={fontSizeDraft}
+                onChange={(e) => setFontSizeDraft(Number(e.target.value))}
+                onBlur={applyFontSize}
+                onKeyDown={(e) => e.key === "Enter" && applyFontSize()}
+              />
+            </label>
+            <label className="adv-row">
+              <span>Line numbers</span>
+              <input
+                type="checkbox"
+                checked={props.lineNumbers}
+                onChange={(e) => {
+                  props.onLineNumbers(e.target.checked);
+                  props.onLog?.(`line numbers: ${e.target.checked ? "on" : "off"}`);
+                }}
+              />
+            </label>
+          </div>
+        )}
+      </div>
+
       <h2>Advanced</h2>
       <div className="pad adv">
-        <label className="adv-row">
-          <span>Theme</span>
-          <select
-            className="inp"
-            value={props.theme}
-            onChange={(e) => props.onTheme(e.target.value as "dark" | "light")}
-          >
-            <option value="dark">Dark</option>
-            <option value="light">Light</option>
-          </select>
-        </label>
         <label className="adv-row">
           <span>Sync interval, s</span>
           <input

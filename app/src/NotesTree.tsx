@@ -22,6 +22,32 @@ function stripMd(name: string): string {
   return name.replace(/\.md$/i, "");
 }
 
+/// Theme-aware folder glyph (SVG + currentColor — follows every color
+/// scheme; the emoji did not). The open/closed state is switched by CSS
+/// on `details[open]`, so both variants are rendered.
+function FolderIcon() {
+  return (
+    <span className="dir-icon" aria-hidden>
+      <svg className="di-closed" viewBox="0 0 16 16" width="13" height="13">
+        <path
+          d="M1.5 12.5v-8c0-.55.45-1 1-1h3.1c.3 0 .58.15.76.4l.9 1.15H13c.55 0 1 .45 1 1v6.45c0 .55-.45 1-1 1H2.5c-.55 0-1-.45-1-1z"
+          fill="currentColor"
+          opacity=".5"
+        />
+        <rect x="1.5" y="7.6" width="13" height="5.9" rx="1" fill="currentColor" />
+      </svg>
+      <svg className="di-open" viewBox="0 0 16 16" width="13" height="13">
+        <path
+          d="M1.5 12.5v-8c0-.55.45-1 1-1h3.1c.3 0 .58.15.76.4l.9 1.15H13c.55 0 1 .45 1 1v6.45c0 .55-.45 1-1 1H2.5c-.55 0-1-.45-1-1z"
+          fill="currentColor"
+          opacity=".5"
+        />
+        <path d="M1.8 7.5h13l-1.5 5.5H.3z" fill="currentColor" />
+      </svg>
+    </span>
+  );
+}
+
 function buildTree(notes: NoteSummary[], folders: string[]): TreeNode[] {
   const root = new Map<string, TreeNode>();
   const ensureFolder = (path: string): Map<string, TreeNode> => {
@@ -364,7 +390,16 @@ export function NotesTree({
             onTouchMove={onTouchMoveCancel}
             onTouchEnd={onTouchEndCancel}
           >
-            <span className="dir-icon">{dropDir === path ? "📂" : "📁"}</span>
+            <svg
+              className="dir-chev"
+              viewBox="0 0 8 8"
+              width="8"
+              height="8"
+              aria-hidden
+            >
+              <path d="M2.2 1l3.6 3-3.6 3z" fill="currentColor" />
+            </svg>
+            <FolderIcon />
             <span className="dir-name">{node.name}</span>
             <span className="muted dir-count">{countNotesUnder(notes, path)}</span>
           </summary>

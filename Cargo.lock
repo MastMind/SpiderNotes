@@ -3472,7 +3472,7 @@ dependencies = [
 
 [[package]]
 name = "spidernotes-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -3492,7 +3492,7 @@ dependencies = [
 
 [[package]]
 name = "spidernotes-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -3510,14 +3510,14 @@ dependencies = [
 
 [[package]]
 name = "spidernotes-fgservice"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "tauri",
 ]
 
 [[package]]
 name = "spidernotes-p2p"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3539,7 +3539,7 @@ dependencies = [
 
 [[package]]
 name = "spidernotes-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "rand",
