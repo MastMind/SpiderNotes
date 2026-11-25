@@ -172,12 +172,10 @@ export function Editor({
         }),
         EditorView.theme({
           "&": { height: "100%" },
-          // Monospace everywhere (the app's UI font is monospace too) —
-          // a nicer stack than the bare `monospace` keyword.
+          // font family + size of the note text come from the CSS vars
+          // --note-font / --note-fs (the "Note font" design settings)
           ".cm-scroller": {
             overflow: "auto",
-            fontFamily:
-              'ui-monospace, "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace',
           },
         }),
       ],

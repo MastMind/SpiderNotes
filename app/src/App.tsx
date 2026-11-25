@@ -72,11 +72,17 @@ export default function App() {
     const t = localStorage.getItem("sn.theme");
     return THEMES.some((x) => x.id === t) ? (t as string) : "dark";
   });
-  // UI font size in px (design setting; 12..18, default 14).
+  // Note text size in px (design setting; 12..18, default 14). Scales only
+  // the editor content (--note-fs); the UI chrome keeps its base size.
   const [fontSize, setFontSize] = useState<number>(() => {
     const n = parseInt(localStorage.getItem("sn.fontSize") || "", 10);
     return Number.isFinite(n) && n >= 12 && n <= 18 ? n : 14;
   });
+  // Note text font family (design setting): "mono" (default) or "sans"
+  // (the bundled Montserrat).
+  const [noteFont, setNoteFont] = useState<string>(() =>
+    localStorage.getItem("sn.noteFont") === "sans" ? "sans" : "mono"
+  );
   // Editor line-number gutter (design setting; on by default).
   const [lineNumbers, setLineNumbers] = useState<boolean>(
     () => localStorage.getItem("sn.lineNumbers") !== "0",
@@ -241,11 +247,17 @@ export default function App() {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
 
-  // Font size: the whole UI scales from --ui-fs (styles.css).
+  // Note text size: only the editor content scales from --note-fs
+  // (styles.css); the UI chrome keeps its base --ui-fs.
   useEffect(() => {
     localStorage.setItem("sn.fontSize", String(fontSize));
-    document.documentElement.style.setProperty("--ui-fs", `${fontSize}px`);
+    document.documentElement.style.setProperty("--note-fs", `${fontSize}px`);
   }, [fontSize]);
+
+  useEffect(() => {
+    localStorage.setItem("sn.noteFont", noteFont);
+    document.documentElement.dataset.noteFont = noteFont;
+  }, [noteFont]);
 
   useEffect(() => {
     localStorage.setItem("sn.lineNumbers", lineNumbers ? "1" : "0");
@@ -258,7 +270,12 @@ export default function App() {
   const showSidebarRef = useRef(showSidebar);
   showSidebarRef.current = showSidebar;
   useEffect(() => {
-    let start: { x: number; y: number; inSidebar: boolean } | null = null;
+    let start: {
+      x: number;
+      y: number;
+      inSidebar: boolean;
+      inText: boolean;
+    } | null = null;
     const onStart = (e: TouchEvent) => {
       const t = e.touches[0];
       if (!t) return;
@@ -267,6 +284,13 @@ export default function App() {
         x: t.clientX,
         y: t.clientY,
         inSidebar: !!el?.closest?.(".sidebar"),
+        // a horizontal drag starting here moves the caret / scrolls the
+        // overlay — never treat it as a navigation swipe. The EDITOR is
+        // deliberately NOT excluded: with wrapped lines and no horizontal
+        // scroll a horizontal swipe there does nothing, and excluding it
+        // would make the list un-openable while a note is open (the editor
+        // then covers the whole screen).
+        inText: !!el?.closest?.("input, textarea, .panel"),
       };
     };
     const onEnd = (e: TouchEvent) => {
@@ -277,15 +301,22 @@ export default function App() {
       const dx = t.clientX - s.x;
       const dy = t.clientY - s.y;
       if (Math.abs(dx) < 60 || Math.abs(dx) <= 1.5 * Math.abs(dy)) return;
-      if (dx > 0 && s.x <= 24 && !showSidebarRef.current) {
-        setShowSidebar(true);
-      } else if (
+      const isMobile = window.matchMedia("(max-width: 700px)").matches;
+      if (
         dx < 0 &&
         s.inSidebar &&
         showSidebarRef.current &&
         !document.querySelector(".drag-ghost")
       ) {
         setShowSidebar(false);
+      } else if (dx > 0 && !showSidebarRef.current) {
+        // open: desktop — from the left 24px edge (the rail is right
+        // there); mobile — from anywhere on the screen (the rail is
+        // hidden), except inside text inputs, the editor or the settings
+        // panel, where a horizontal drag has its own meaning
+        if (isMobile ? !s.inText : s.x <= 24) {
+          setShowSidebar(true);
+        }
       }
     };
     window.addEventListener("touchstart", onStart, { passive: true });
@@ -716,7 +747,7 @@ export default function App() {
 
   return (
     <div className="layout">
-      <header className="topbar">
+     <header className="topbar">
         <div className="brand">
           SpiderNotes <span className="muted">· {open.device_name}</span>
         </div>
@@ -724,23 +755,6 @@ export default function App() {
           <span className={dirty ? "status dirty" : "status"}>
             {dirty ? "unsaved" : "saved"}
           </span>
-          <button
-             title="Close the selected note"
-             onClick={() => {
-               setSelected(null);
-               setDoc("");
-             }}
-           >
-             <span className="btn-long">Close note</span>
-             <span className="btn-short">✕</span>
-           </button>
-          <button
-             className={showNet ? "icon-btn active" : "icon-btn"}
-             title="Network & log"
-             onClick={() => setShowNet((v) => !v)}
-           >
-             <GearIcon />
-           </button>
         </div>
       </header>
 
@@ -766,23 +780,38 @@ export default function App() {
             );
           }}
         >
-          {/* Mobile only: on narrow screens the sidebar is a full-screen
-              overlay, so it needs its own close button (the rail is
-              covered). */}
-          <button
-            className="close-sidebar"
-            title="Close notes list"
-            onClick={() => setShowSidebar(false)}
-          >
-            ✕
-          </button>
-          <div className="pad">
+          {/* Top row: search + note close + settings gear, in the panel's
+              top-right corner (on phones the panel covers the top bar,
+              so the gear lives here, not in the header). */}
+          <div className="side-top">
             <input
               className="inp"
               placeholder="Search in text..."
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
+            <button
+              className="icon-btn"
+              title={
+                selected
+                  ? "Close the selected note"
+                  : "No note selected"
+              }
+              disabled={!selected}
+              onClick={() => {
+                setSelected(null);
+                setDoc("");
+              }}
+            >
+              ✕
+            </button>
+            <button
+              className={showNet ? "icon-btn active" : "icon-btn"}
+              title="Network & log"
+              onClick={() => setShowNet((v) => !v)}
+            >
+              <GearIcon />
+            </button>
           </div>
           {tags.length > 0 && (
             <div className="tags">
@@ -890,15 +919,8 @@ export default function App() {
           <div className="main-content">
             {selected ? (
             <div className="editor-area">
-              <div className="editor-toolbar">
-                <button
-                  className={live ? "live-toggle" : "live-toggle active"}
-                  title="Toggle: live preview / raw Markdown"
-                  onClick={() => setLive((v) => !v)}
-                >
-                  {live ? "Raw MD" : "Preview"}
-                </button>
-              </div>
+              {/* Preview / Raw Markdown toggle now lives in the Visual
+                  settings section (gear -> Visual settings). */}
               <Editor
                 doc={doc}
                 onDoc={onDoc}
@@ -914,7 +936,7 @@ export default function App() {
             <div className="empty">
               {showSidebar
                 ? "Select a note on the left or create a new one"
-                : "Press › on the left to open the notes list"}
+                : "Press › on the left to open the notes list (swipe — on a phone)"}
             </div>
           )}
             {error && <div className="error">{error}</div>}
@@ -941,6 +963,10 @@ export default function App() {
             onFontSize={setFontSize}
             lineNumbers={lineNumbers}
             onLineNumbers={setLineNumbers}
+            live={live}
+            onLive={setLive}
+            noteFont={noteFont}
+            onNoteFont={setNoteFont}
             onClose={() => setShowNet(false)}
           />
         )}

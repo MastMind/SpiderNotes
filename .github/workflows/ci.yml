@@ -111,11 +111,15 @@ jobs:
             # arm64 debs live in the ports archive; the main archive lists
             # arm64 in its Release index but 404s the index files, so split
             # the sources by arch (main: amd64, ports: arm64)
+            # noble-security on BOTH sides: security updates of shared
+            # deps (e.g. libxrender1) land there, and the -updates packages
+            # pin the newer versions — without the suite the arm64 index
+            # is missing the version the resolver needs
             sudo bash -c 'printf "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: noble noble-updates noble-backports noble-security\nComponents: main universe\nArchitectures: amd64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n" > /etc/apt/sources.list.d/main.sources'
-            sudo bash -c 'printf "Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble noble-updates noble-backports\nComponents: main universe\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n" > /etc/apt/sources.list.d/ports-arm64.sources'
+            sudo bash -c 'printf "Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble noble-updates noble-backports noble-security\nComponents: main universe\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n" > /etc/apt/sources.list.d/ports-arm64.sources'
             sudo rm -f /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources
             sudo dpkg --add-architecture arm64
-            sudo apt-get update
+            sudo apt-get update || sudo apt-get update
             # native python3 + qemu satisfy libglib2.0-dev:arm64's
             # "python3 | qemu-user | qemu-user-static" and "python3:any" deps;
             # otherwise apt pulls an arm64 python whose postinst cannot run

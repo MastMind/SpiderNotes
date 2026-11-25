@@ -83,12 +83,14 @@ window.__TAURI_INTERNALS__ = {
 };
 `;
 
-const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
+const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".woff2": "font/woff2" };
+const BINARY = new Set([".woff2", ".woff", ".png"]);
 const server = createServer((req, res) => {
   let p = req.url.split("?")[0];
   if (p === "/") p = "/index.html";
   try {
-    let body = readFileSync(path.join(DIST, p), "utf8");
+    // binary assets must be served as buffers (utf8 decoding corrupts them)
+    let body = readFileSync(path.join(DIST, p), BINARY.has(extname(p)) ? undefined : "utf8");
     if (p === "/index.html" && mockSource) {
       // inline classic script BEFORE the module bundle: runs first, always
       body = body.replace(
@@ -220,6 +222,21 @@ check("editor font is monospace", /monospace/.test(ed.contentFont), ed.contentFo
 check("line numbers gutter ON by default", ed.hasGutter);
 check("font size default 14px (body + editor)", ed.bodyFontSize === "14px" && ed.contentFontSize === "14px", `body=${ed.bodyFontSize} content=${ed.contentFontSize}`);
 
+// Montserrat on the UI chrome (bundled woff2, offline), monospace content
+const fonts = await evalJs(`document.fonts.ready.then(() => ({
+  brand: getComputedStyle(document.querySelector(".brand")).fontFamily,
+  loaded400: document.fonts.check("400 14px Montserrat"),
+  loaded600: document.fonts.check("600 14px Montserrat"),
+  editor: getComputedStyle(document.querySelector(".cm-content")).fontFamily,
+  tree: getComputedStyle(document.querySelector("button.tree-item")).fontFamily,
+}))`);
+check("fonts: brand uses Montserrat", /Montserrat/.test(fonts.brand), fonts.brand);
+check("fonts: Montserrat loaded (400 + 600)", fonts.loaded400 && fonts.loaded600, `400=${fonts.loaded400} 600=${fonts.loaded600}`);
+check("fonts: editor + notes tree stay monospace",
+  /monospace/.test(fonts.editor) && !/Montserrat/.test(fonts.editor) &&
+  /monospace/.test(fonts.tree) && !/Montserrat/.test(fonts.tree),
+  `editor=${fonts.editor} tree=${fonts.tree}`);
+
 // sidebar slide: rail closes it (slides off-screen, editor widens) and
 // opens it back (slides in, editor returns to its width)
 const rail0 = await evalJs(`(() => {
@@ -298,26 +315,93 @@ const d1 = await evalJs(`(() => {
 })()`);
 await sleep(300);
 const d2 = await evalJs(`(() => {
-  const sel = document.querySelector(".design-body select.sel");
+  const sels = Array.from(document.querySelectorAll(".design-body select.sel"));
+  const ev = sels[0];
+  const nf = sels[1];
+  const sel = sels[2];
   const opts = sel ? Array.from(sel.options).map(o => o.value) : [];
-  const num = document.querySelector(".design-body input.num");
+  const range = document.querySelector(".design-body input[type=range]");
   const cb = document.querySelector(".design-body input[type=checkbox]");
   return {
     sectionVisible: !!document.querySelector(".design-body"),
+    editorView: ev ? Array.from(ev.options).map(o => o.value) : [],
+    noteFont: nf ? Array.from(nf.options).map(o => o.value) : [],
     themes: opts,
-    hasFontSize: !!num,
+    hasFontSize: !!range,
     hasLineNumbers: !!cb,
     cbChecked: cb ? cb.checked : null,
   };
 })()`);
-check("Design: button in the panel toggles the section", d1.found && d2.sectionVisible);
-check("Design: theme select has all 5 themes", JSON.stringify(d2.themes) === JSON.stringify(["dark","light","midnight","forest","paper"]), JSON.stringify(d2.themes));
-check("Design: font size + line numbers controls present", d2.hasFontSize && d2.hasLineNumbers);
-check("Design: line numbers checkbox reflects state (on)", d2.cbChecked === true);
+check("Visual: button in the panel toggles the section", d1.found && d2.sectionVisible);
+check("Visual: editor view select (preview/raw) present", JSON.stringify(d2.editorView) === JSON.stringify(["preview","raw"]), JSON.stringify(d2.editorView));
+check("Visual: note font select (mono/sans) present", JSON.stringify(d2.noteFont) === JSON.stringify(["mono","sans"]), JSON.stringify(d2.noteFont));
+check("Visual: theme select has all 5 themes", JSON.stringify(d2.themes) === JSON.stringify(["dark","light","midnight","forest","paper"]), JSON.stringify(d2.themes));
+check("Visual: font size slider + line numbers controls present", d2.hasFontSize && d2.hasLineNumbers);
+check("Visual: line numbers checkbox reflects state (on)", d2.cbChecked === true);
+
+// note font select: switch to Montserrat, the editor content follows
+await evalJs(`(() => {
+  const nf = document.querySelectorAll(".design-body select.sel")[1];
+  nf.value = "sans";
+  nf.dispatchEvent(new Event("change", { bubbles: true }));
+  return "set";
+})()`);
+await sleep(400);
+const nf2 = await evalJs(`(() => ({
+  data: document.documentElement.dataset.noteFont,
+  ls: localStorage.getItem("sn.noteFont"),
+  content: getComputedStyle(document.querySelector(".cm-content")).fontFamily,
+  gutter: getComputedStyle(document.querySelector(".cm-gutters")).fontFamily,
+}))()`);
+check("Visual: note font select switches the editor to Montserrat",
+  nf2.data === "sans" && nf2.ls === "sans" && /Montserrat/.test(nf2.content) && /Montserrat/.test(nf2.gutter),
+  JSON.stringify(nf2));
+await evalJs(`(() => {
+  const nf = document.querySelectorAll(".design-body select.sel")[1];
+  nf.value = "mono";
+  nf.dispatchEvent(new Event("change", { bubbles: true }));
+  return "set";
+})()`);
+await sleep(200);
+
+// font size slider: applies immediately (no blur/Enter), persists.
+// (React tracks the input value itself, so set it through the native
+//  setter — a plain r.value = ... is seen as "unchanged".)
+await evalJs(`(() => {
+  const r = document.querySelector(".design-body input[type=range]");
+  const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+  desc.set.call(r, "16");
+  r.dispatchEvent(new Event("input", { bubbles: true }));
+  r.dispatchEvent(new Event("change", { bubbles: true }));
+  return "set";
+})()`);
+await sleep(400);
+const fs16 = await evalJs(`(() => ({
+  body: getComputedStyle(document.body).fontSize,
+  content: getComputedStyle(document.querySelector(".cm-content")).fontSize,
+  gutter: getComputedStyle(document.querySelector(".cm-gutters")).fontSize,
+  val: document.querySelector(".design-body .range-val").textContent,
+  ls: localStorage.getItem("sn.fontSize"),
+}))()`);
+// the slider scales the NOTE TEXT only; the UI chrome keeps 14px
+check("Visual: font size slider scales the note text only (body stays 14px)",
+  fs16.body === "14px" && fs16.content === "16px" && fs16.gutter === "16px" && fs16.val === "16" && fs16.ls === "16",
+  JSON.stringify(fs16));
+
+// editor view select: switch to raw, persisted
+await evalJs(`(() => {
+  const ev = document.querySelectorAll(".design-body select.sel")[0];
+  ev.value = "raw";
+  ev.dispatchEvent(new Event("change", { bubbles: true }));
+  return "set";
+})()`);
+await sleep(300);
+const evs = await evalJs(`(() => ({ ls: localStorage.getItem("sn.live") }))()`);
+check("Visual: editor view select persists raw mode", evs.ls === "0", JSON.stringify(evs));
 
 // switch theme to midnight inside the panel, verify CSS vars
 await evalJs(`(() => {
-  const sel = document.querySelector(".design-body select.sel");
+  const sel = document.querySelectorAll(".design-body select.sel")[2];
   sel.value = "midnight";
   sel.dispatchEvent(new Event("change", { bubbles: true }));
   return "set";
@@ -366,37 +450,51 @@ const p2 = await evalJs(`(() => ({
   fg: getComputedStyle(document.body).color,
 }))()`);
 check("persisted: theme forest applied on load", p2.dataTheme === "forest", p2.dataTheme);
-check("persisted: font size 17px on body and editor", p2.bodyFs === "17px" && p2.contentFs === "17px", `body=${p2.bodyFs} content=${p2.contentFs}`);
+check("persisted: note font size 17px (body stays 14px)", p2.bodyFs === "14px" && p2.contentFs === "17px", `body=${p2.bodyFs} content=${p2.contentFs}`);
 check("persisted: line numbers stay off", !p2.gutter);
 
-// ============ scenario 3: mobile full-screen sidebar ============
+// ============ scenario 3: mobile full-screen sidebar, swipes only ============
 await send("Emulation.setDeviceMetricsOverride", { width: 400, height: 800, deviceScaleFactor: 1, mobile: true });
-await loadWith(`localStorage.removeItem("sn.showSidebar");`, URL);
-const mb = await evalJs(`(() => {
-  const rail = document.querySelector(".side-rail");
-  rail.click();
-  return "rail clicked";
+await loadWith(`
+localStorage.removeItem("sn.showSidebar");
+localStorage.removeItem("sn.showNet"); // scenario 1 left the panel open
+`, URL);
+const railHidden = await evalJs(`getComputedStyle(document.querySelector(".side-rail")).display === "none"`);
+check("mobile: the rail button is hidden", railHidden);
+// open with a right swipe from the MIDDLE of the screen (the whole screen
+// is the trigger area on phones)
+const swipeOpen = await evalJs(`(() => {
+  const target = document.elementFromPoint(200, 400) || document.body;
+  const t1 = new Touch({ identifier: 21, target, clientX: 120, clientY: 400, pageX: 120, pageY: 400 });
+  target.dispatchEvent(new TouchEvent("touchstart", { bubbles: true, cancelable: true, touches: [t1], targetTouches: [t1], changedTouches: [t1] }));
+  const t2 = new Touch({ identifier: 21, target, clientX: 320, clientY: 400, pageX: 320, pageY: 400 });
+  target.dispatchEvent(new TouchEvent("touchend", { bubbles: true, cancelable: true, touches: [], targetTouches: [], changedTouches: [t2] }));
+  return true;
 })()`);
 await sleep(600);
 const mb2 = await evalJs(`(() => {
   const sb = document.querySelector(".sidebar");
   const r = sb.getBoundingClientRect();
-  const closeBtn = document.querySelector(".close-sidebar");
   return {
     left: r.left, top: r.top,
     w: r.width, h: r.height,
     vw: window.innerWidth, vh: window.innerHeight,
     pos: getComputedStyle(sb).position,
-    closeVisible: closeBtn ? getComputedStyle(closeBtn).display !== "none" : false,
     editorCovered: !!document.querySelector(".main-content") && r.width >= window.innerWidth - 1,
   };
 })()`);
-check("mobile: sidebar is a full-screen overlay",
-  mb2.pos === "fixed" && mb2.w >= mb2.vw - 1 && mb2.h >= mb2.vh - 1 && mb2.left === 0 && mb2.top === 0,
+check("mobile: right swipe (anywhere) opens the full-screen overlay",
+  swipeOpen === true && mb2.pos === "fixed" && mb2.w >= mb2.vw - 1 && mb2.h >= mb2.vh - 1 && mb2.left === 0 && mb2.top === 0,
   JSON.stringify(mb2));
-check("mobile: close button visible", mb2.closeVisible);
-// close it with the button — the overlay slides off to the left
-await evalJs(`(() => { document.querySelector(".close-sidebar").click(); return "x"; })()`);
+// close with a left swipe inside the list — the overlay slides off to the left
+const swipeClose = await evalJs(`(() => {
+  const target = document.querySelector(".sidebar .tree-item") || document.querySelector(".side-top");
+  const t1 = new Touch({ identifier: 22, target, clientX: 300, clientY: 400, pageX: 300, pageY: 400 });
+  target.dispatchEvent(new TouchEvent("touchstart", { bubbles: true, cancelable: true, touches: [t1], targetTouches: [t1], changedTouches: [t1] }));
+  const t2 = new Touch({ identifier: 22, target, clientX: 100, clientY: 400, pageX: 100, pageY: 400 });
+  target.dispatchEvent(new TouchEvent("touchend", { bubbles: true, cancelable: true, touches: [], targetTouches: [], changedTouches: [t2] }));
+  return true;
+})()`);
 await sleep(450);
 const mb3 = await evalJs(`(() => {
   const s = document.querySelector(".sidebar");
@@ -404,7 +502,38 @@ const mb3 = await evalJs(`(() => {
   const r = s.getBoundingClientRect();
   return { offscreen: r.right <= 1, right: r.right };
 })()`);
-check("mobile: close button slides the overlay off-screen", mb3.offscreen, JSON.stringify(mb3));
+check("mobile: left swipe slides the overlay off-screen", swipeClose === true && mb3.offscreen, JSON.stringify(mb3));
+// regression: with a note OPEN the editor covers the whole screen — a
+// right swipe from inside the editor must still open the list
+await evalJs(`(() => {
+  document.querySelector('button.tree-item[title="long.md"]').click();
+  return "opened";
+})()`);
+await sleep(800);
+const regPre = await evalJs(`(() => {
+  const sb = document.querySelector(".sidebar").getBoundingClientRect();
+  const at = document.elementFromPoint(200, 400);
+  return {
+    closed: sb.right <= 1,
+    editorAtPoint: !!(at && at.closest && at.closest(".cm-editor")),
+  };
+})()`);
+const swipeOpen2 = await evalJs(`(() => {
+  const target = document.elementFromPoint(200, 400) || document.body;
+  const t1 = new Touch({ identifier: 23, target, clientX: 120, clientY: 400, pageX: 120, pageY: 400 });
+  target.dispatchEvent(new TouchEvent("touchstart", { bubbles: true, cancelable: true, touches: [t1], targetTouches: [t1], changedTouches: [t1] }));
+  const t2 = new Touch({ identifier: 23, target, clientX: 320, clientY: 400, pageX: 320, pageY: 400 });
+  target.dispatchEvent(new TouchEvent("touchend", { bubbles: true, cancelable: true, touches: [], targetTouches: [], changedTouches: [t2] }));
+  return true;
+})()`);
+await sleep(600);
+const regPost = await evalJs(`(() => {
+  const r = document.querySelector(".sidebar").getBoundingClientRect();
+  return { left: r.left, top: r.top };
+})()`);
+check("mobile: swipe opens the list even with a note open (editor covers the screen)",
+  regPre.closed && regPre.editorAtPoint && swipeOpen2 === true && regPost.left === 0 && regPost.top === 0,
+  `pre=${JSON.stringify(regPre)} post=${JSON.stringify(regPost)}`);
 
 await send("Emulation.clearDeviceMetricsOverride");
 chrome.kill();

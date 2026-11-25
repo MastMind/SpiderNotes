@@ -58,6 +58,10 @@ export function PeersPanel(props: {
   onFontSize: (n: number) => void;
   lineNumbers: boolean;
   onLineNumbers: (b: boolean) => void;
+  live: boolean;
+  onLive: (v: boolean) => void;
+  noteFont: string;
+  onNoteFont: (f: string) => void;
   onClose?: () => void;
 }) {
   const logRef = useRef<HTMLDivElement>(null);
@@ -93,17 +97,8 @@ export function PeersPanel(props: {
   // In-app confirmation (window.confirm in the webview is unreliable: the
   // native dialog can close without the result reaching the JS).
   const [confirmPeer, setConfirmPeer] = useState<PeerInfo | null>(null);
-  // Design section: hidden until its button is pressed; font size keeps a
-  // draft like the other number inputs (applied on blur / Enter).
+  // Design section: hidden until its button is pressed.
   const [showDesign, setShowDesign] = useState(false);
-  const [fontSizeDraft, setFontSizeDraft] = useState(props.fontSize);
-
-  const applyFontSize = () => {
-    const n = Math.max(12, Math.min(18, Math.round(fontSizeDraft) || 14));
-    setFontSizeDraft(n);
-    props.onFontSize(n);
-    props.onLog?.(`font size: ${n}px`);
-  };
 
   useEffect(() => {
     let cancelled = false;
@@ -374,37 +369,79 @@ export function PeersPanel(props: {
           {showDesign ? "Hide visual settings" : "Visual settings"}
         </button>
         {showDesign && (
-          <div className="design-body">
-            <label className="adv-row">
-              <span>Theme</span>
-              <select
-                className="inp sel"
-                value={props.theme}
-                onChange={(e) => {
-                  props.onTheme(e.target.value);
-                  props.onLog?.(`theme: ${e.target.value}`);
-                }}
-              >
-                {THEMES.map((t) => (
-                  <option key={t.id} value={t.id}>
-                    {t.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="adv-row">
-              <span>Font size, px</span>
-              <input
-                className="inp num"
-                type="number"
-                min={12}
-                max={18}
-                value={fontSizeDraft}
-                onChange={(e) => setFontSizeDraft(Number(e.target.value))}
-                onBlur={applyFontSize}
-                onKeyDown={(e) => e.key === "Enter" && applyFontSize()}
-              />
-            </label>
+      <div className="design-body">
+             <label className="adv-row">
+               <span>Editor view</span>
+               <select
+                 className="inp sel"
+                 value={props.live ? "preview" : "raw"}
+                 onChange={(e) => {
+                   const v = e.target.value === "preview";
+                   props.onLive(v);
+                   props.onLog?.(
+                     `editor view: ${v ? "preview" : "raw markdown"}`
+                   );
+                 }}
+               >
+                 <option value="preview">Preview (rendered)</option>
+                 <option value="raw">Raw Markdown</option>
+               </select>
+             </label>
+             <label className="adv-row">
+               <span>Note font</span>
+               <select
+                 className="inp sel"
+                 value={props.noteFont}
+                 onChange={(e) => {
+                   props.onNoteFont(e.target.value);
+                   props.onLog?.(
+                     `note font: ${
+                       e.target.value === "sans" ? "Montserrat" : "monospace"
+                     }`
+                   );
+                 }}
+               >
+                 <option value="mono">Monospace</option>
+                 <option value="sans">Montserrat</option>
+               </select>
+             </label>
+             <label className="adv-row">
+               <span>Theme</span>
+               <select
+                 className="inp sel"
+                 value={props.theme}
+                 onChange={(e) => {
+                   props.onTheme(e.target.value);
+                   props.onLog?.(`theme: ${e.target.value}`);
+                 }}
+               >
+                 {THEMES.map((t) => (
+                   <option key={t.id} value={t.id}>
+                     {t.label}
+                   </option>
+                 ))}
+               </select>
+             </label>
+             <label className="adv-row">
+               <span>Note font size, px</span>
+               <input
+                 className="inp range"
+                 type="range"
+                 min={12}
+                 max={18}
+                 step={1}
+                 value={props.fontSize}
+                 onChange={(e) => {
+                   const n = Math.max(
+                     12,
+                     Math.min(18, Math.round(Number(e.target.value)) || 14)
+                   );
+                   props.onFontSize(n);
+                   props.onLog?.(`note font size: ${n}px`);
+                 }}
+               />
+               <span className="range-val">{props.fontSize}</span>
+             </label>
             <label className="adv-row">
               <span>Line numbers</span>
               <input

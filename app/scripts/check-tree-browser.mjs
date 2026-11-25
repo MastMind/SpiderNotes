@@ -103,7 +103,7 @@ window.__TAURI_INTERNALS__ = {
 };
 `;
 
-const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" };
+const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png", ".woff2": "font/woff2" };
 const server = createServer((req, res) => {
   let p = req.url.split("?")[0];
   if (p === "/") p = "/index.html";
@@ -347,10 +347,10 @@ const nfArgs = await evalJs(`(() => {
 })()`);
 check("note menu 'New folder here' -> create_folder home/nf-test", nfHere === "clicked" && nfArgs && nfArgs.path === "home/nf-test", JSON.stringify(nfArgs));
 
-// ---- 5c. right-click anywhere else in the panel (search pad) -> root menu;
+// ---- 5c. right-click anywhere else in the panel (top row) -> root menu;
 //      right-click on an input is not intercepted (native copy/paste menu) ----
 const padClick = await evalJs(`(() => {
-  const pad = document.querySelector(".sidebar .pad");
+  const pad = document.querySelector(".side-top");
   if (!pad) return "no pad";
   const r = pad.getBoundingClientRect();
   pad.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: r.x + 3, clientY: r.y + 3 }));

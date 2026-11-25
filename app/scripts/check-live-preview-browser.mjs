@@ -124,7 +124,7 @@ window.__TAURI_INTERNALS__ = {
 };
 `;
 
-const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" };
+const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png", ".woff2": "font/woff2" };
 const server = createServer((req, res) => {
   let p = req.url.split("?")[0];
   if (p === "/") p = "/index.html";
