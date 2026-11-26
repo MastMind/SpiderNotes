@@ -139,9 +139,11 @@ jobs:
                 ok=1
                 break
               fi
-              echo "::warning::arm64 dependency resolution failed (attempt $attempt); re-fetching indexes"
+              echo "::warning::arm64 dependency resolution failed (attempt $attempt); re-checking indexes"
+              # no full wipe: the update at the top of the loop re-fetches only
+              # the re-published indexes (InRelease changed), so a retry costs
+              # seconds instead of a 60 MB re-download
               sleep 30
-              sudo rm -rf /var/lib/apt/lists
             done
             if [ -z "$ok" ]; then
               echo "::error::arm64 dependencies unresolvable after 3 attempts"

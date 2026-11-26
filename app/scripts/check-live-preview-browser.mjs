@@ -229,6 +229,7 @@ const state = async (label) => {
       cmEditor: !!document.querySelector(".cm-editor"),
       cmLines: document.querySelectorAll(".cm-line").length,
       cmText: Array.from(document.querySelectorAll(".cm-line")).map(l => l.textContent.slice(0, 50)),
+      cmClasses: Array.from(document.querySelectorAll(".cm-line")).map(l => l.className),
       errorDiv: document.querySelector(".error")?.textContent || null,
     });
   })()`);
@@ -267,6 +268,25 @@ for (const [p, content] of Object.entries(realNotes)) {
   if (bodyLine && !s.cmText.some((t) => t.includes(bodyLine.slice(0, 20)))) {
     console.log("FAIL: body content missing:", bodyLine.slice(0, 40));
     fail++;
+  }
+  // a heading line — especially the FIRST visible line right after a hidden
+  // id-only frontmatter block — must carry its md-hN line class (regression:
+  // the frontmatter replace decoration used to swallow the line decoration
+  // of the line that follows it, rendering the title as plain text)
+  let lines = content.split("\n");
+  if (lines[0]?.trim() === "---") {
+    const end = lines.findIndex((l, i) => i > 0 && l.trim() === "---");
+    if (end >= 0) lines = lines.slice(end + 1);
+  }
+  const heading = lines.find((l) => /^#{1,6}\s/.test(l));
+  if (heading) {
+    const level = heading.match(/^#+/)[0].length;
+    const idx = s.cmText.findIndex((t) => t.includes(heading.slice(0, 20)));
+    const cls = idx >= 0 ? s.cmClasses[idx] : "";
+    if (!cls.includes(`md-h${level}`)) {
+      console.log(`FAIL: heading line lost its md-h${level} class (line: ${heading.slice(0, 40)}, class: ${cls || "not found"})`);
+      fail++;
+    }
   }
 }
 

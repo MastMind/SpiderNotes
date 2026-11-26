@@ -170,7 +170,7 @@ export function computePreviewDecos(doc: Text): DecorationSet {
   // (then by startSide). The hidden frontmatter ranges do NOT always start
   // at 0 (a user's own frontmatter lines keep the opening fence visible),
   // so collect everything and sort once before building.
-  // startSide order: line (-2e8) < replace (5e8-1) < mark (5e8).
+  // startSide order: block replace (-3e8-1) < line (-2e8) < mark (5e8).
   type Item = { from: number; to: number; deco: Decoration; side: number };
   const items: Item[] = [];
   const hidden = idHideRanges(doc);
@@ -180,7 +180,21 @@ export function computePreviewDecos(doc: Text): DecorationSet {
       const ln = doc.line(i);
       if (ln.from >= f && ln.from < t) hiddenLines.add(i);
     }
-    items.push({ from: f, to: t, deco: Decoration.replace({}), side: 1 });
+    // Both flags matter, for different CodeMirror internals:
+    // - `block: true`: a plain (inline) replace spanning line breaks
+    //   materializes as an inline widget inside the NEXT line, forcing an
+    //   empty line start before the following line decoration is read —
+    //   the heading/list classes of the first visible line are dropped.
+    // - `inclusiveEnd: false`: the default block replace ends with
+    //   endSide +2e8+1, which sorts a line decoration at the same position
+    //   AFTER the replace (into a later RangeSet layer). The tile builder
+    //   then starts the first visible line before it reads the line
+    //   decoration, and the pending line attributes are silently dropped.
+    //   With a non-inclusive end (endSide -6e8+1) the line decoration sorts
+    //   right after the replace, in the same layer, before the first mark
+    //   span of the visible line.
+    // (startSide -3e8-1 < line -2e8 < mark 5e8, hence side -1 in the sort.)
+    items.push({ from: f, to: t, deco: Decoration.replace({ block: true, inclusiveEnd: false }), side: -1 });
   }
   let inFence = false;
   for (let i = 1; i <= doc.lines; i++) {
