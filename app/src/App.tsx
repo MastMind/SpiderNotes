@@ -1,30 +1,25 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import * as api from "./api";
-import type { Backlink, NoteSummary, OpenResult, PeerInfo, TagCount } from "./types";
+import type { Backlink, Conflict, NoteSummary, OpenResult, PeerInfo, P2pSettings, TagCount } from "./types";
 import { Editor } from "./Editor";
-import { NotesTree } from "./NotesTree";
+import { NotesTree, formatWhen } from "./NotesTree";
 import { PeersPanel } from "./PeersPanel";
 import { THEMES } from "./themes";
-
-function GearIcon() {
-  return (
-    <svg
-      width="15"
-      height="15"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-    >
-      <circle cx="12" cy="12" r="3" />
-      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
-    </svg>
-  );
-}
+import {
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  CloseIcon,
+  GearIcon,
+  GlobeIcon,
+  NoteIcon,
+  PlusIcon,
+  SearchIcon,
+  SyncIcon,
+  WarnIcon,
+  WifiIcon,
+  WifiOffIcon,
+} from "./icons";
 
 function savedVaultPath(): string {
   return localStorage.getItem("sn.vaultPath") || "";
@@ -44,6 +39,17 @@ export default function App() {
   const [dirty, setDirty] = useState(false);
   const [query, setQuery] = useState("");
   const [peers, setPeers] = useState<PeerInfo[]>([]);
+  // sync footer data (refreshed with the note list, i.e. after every sync)
+  const [p2p, setP2p] = useState<P2pSettings | null>(null);
+  const [ssOn, setSsOn] = useState(false);
+  // pending sync conflicts (three-way merge leftovers); the note rows show
+  // a warning icon, the panel below offers both versions for a decision
+  const [conflicts, setConflicts] = useState<Conflict[]>([]);
+  const [conflictView, setConflictView] = useState<Conflict | null>(null);
+  const [conflictParts, setConflictParts] = useState<{
+    ours: string;
+    theirs: string;
+  } | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -63,6 +69,35 @@ export default function App() {
     if (v === null) return window.innerWidth > 700;
     return v === "1";
   });
+  // Notes-list panel width in px (desktop, drag the divider; 180..420).
+  const [sidebarW, setSidebarW] = useState(() => {
+    const n = parseInt(localStorage.getItem("sn.sidebarW") || "", 10);
+    return Number.isFinite(n) && n >= 180 && n <= 420 ? n : 250;
+  });
+  const sidebarWRef = useRef(sidebarW);
+  sidebarWRef.current = sidebarW;
+
+  const startResize = useCallback((e: React.PointerEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = sidebarWRef.current;
+    const move = (ev: PointerEvent) => {
+      const w = Math.max(180, Math.min(420, startW + (ev.clientX - startX)));
+      setSidebarW(w);
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      localStorage.setItem("sn.sidebarW", String(sidebarWRef.current));
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }, []);
+
+  const resetSidebarW = useCallback(() => {
+    setSidebarW(250);
+    localStorage.setItem("sn.sidebarW", "250");
+  }, []);
   // live preview (markdown rendered inline in the editor); off = raw source
   const [live, setLive] = useState(
     () => localStorage.getItem("sn.live") !== "0",
@@ -107,24 +142,95 @@ export default function App() {
   const autosaveMsRef = useRef(autosaveSecs * 1000);
   autosaveMsRef.current = autosaveSecs * 1000;
 
+  // device short id (as stored in the HLC) -> friendly name, for the note
+  // rows: the last editor is usually this device or a known peer.
+  const deviceNames = useMemo(() => {
+    const m = new Map<string, string>();
+    const add = (id: string, name: string) => {
+      if (id && name) m.set(id.slice(0, 16), name);
+    };
+    if (open) add(open.device_id, open.device_name);
+    for (const p of peers) add(p.device_id, p.name);
+    return m;
+  }, [open, peers]);
+
+  // note uuid -> number of pending conflicts (the row warning icon)
+  const conflictCount = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const c of conflicts)
+      m.set(c.note_uuid, (m.get(c.note_uuid) ?? 0) + 1);
+    return m;
+  }, [conflicts]);
+
   const addLog = useCallback((line: string) => {
     setLog((l) => [...l.slice(-99), `${ts()}  ${line}`]);
   }, []);
 
   const refresh = useCallback(async () => {
     try {
-      const [n, t, f] = await Promise.all([
+      const [n, t, f, p, s, cf] = await Promise.all([
         api.listNotes(),
         api.allTags(),
         api.listFolders(),
+        api.p2pSettings(),
+        api.serverSyncStatus(),
+        api.listConflicts(),
       ]);
       setNotes(n);
       setTags(t);
       setFolders(f);
+      setP2p(p);
+      setSsOn(s.enabled);
+      // older mocks / a failing call yield null: no conflicts then
+      setConflicts(cf ?? []);
     } catch (e) {
       addLog(`list read error: ${e}`);
     }
   }, [addLog]);
+
+  // Open the conflict panel for a note (the row's warning icon).
+  const openConflict = useCallback(
+    (uuid: string) => {
+      const c = conflicts.find((x) => x.note_uuid === uuid);
+      if (!c) return;
+      setConflictView(c);
+      setConflictParts(null);
+      void (async () => {
+        const [ours, theirs] = await Promise.all([
+          api
+            .readNote(c.note_uuid)
+            .then((n) => n.content)
+            .catch(() => "(this version was deleted)"),
+          api.conflictContent(c.id).catch(() => "(version unavailable)"),
+        ]);
+        setConflictParts({ ours, theirs });
+      })();
+    },
+    [conflicts],
+  );
+
+  const closeConflict = useCallback(() => {
+    setConflictView(null);
+    setConflictParts(null);
+  }, []);
+
+  const doResolveConflict = useCallback(
+    async (keepTheirs: boolean) => {
+      const c = conflictView;
+      if (!c) return;
+      try {
+        await api.resolveConflict(c.id, keepTheirs);
+        addLog(
+          `conflict ${c.note_path}: kept ${keepTheirs ? `"${c.peer_name}"` : "this device's"} version`,
+        );
+        closeConflict();
+        await refresh();
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [conflictView, addLog, closeConflict, refresh],
+  );
 
   // Re-read the currently open note after a sync: the remote side may have
   // changed (or deleted) it, and the editor only follows the `doc` prop.
@@ -168,6 +274,8 @@ export default function App() {
         setNotes(res.notes);
         setPeers(res.peers);
         setFolders(res.folders);
+        // populate the sync footer (p2p settings + relay state)
+        if (!cancelled) void refresh();
       } catch {
         // not in a Tauri context (plain browser) — stay on the welcome screen
       }
@@ -416,24 +524,36 @@ export default function App() {
     [],
   );
 
+  // Immediate (non-debounced) save of the open document. Runs from the
+  // autosave timer and from the hide/exit hooks below, so pending keystrokes
+  // are never lost when the window goes away.
+  const flushSave = useCallback(async () => {
+    if (saveTimer.current) {
+      window.clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    const uuid = selectedRef.current;
+    if (!uuid) return;
+    if (!dirtyRef.current) return;
+    const n = notesRef.current.find((x) => x.uuid === uuid);
+    if (!n) return;
+    try {
+      await api.saveNote(n.path, docRef.current);
+      setDirty(false);
+      addLog(`saved: ${n.path}`);
+      void refresh();
+    } catch (e) {
+      setError(String(e));
+      addLog(`save failed: ${n.path}`);
+    }
+  }, [addLog, refresh]);
+
   const scheduleSave = useCallback(() => {
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(async () => {
-      const uuid = selectedRef.current;
-      if (!uuid) return;
-      const n = notesRef.current.find((x) => x.uuid === uuid);
-      if (!n) return;
-      try {
-        await api.saveNote(n.path, docRef.current);
-        setDirty(false);
-        addLog(`saved: ${n.path}`);
-        void refresh();
-      } catch (e) {
-        setError(String(e));
-        addLog(`save failed: ${n.path}`);
-      }
+    saveTimer.current = window.setTimeout(() => {
+      void flushSave();
     }, autosaveMsRef.current);
-  }, [addLog, refresh]);
+  }, [flushSave]);
 
   const onDoc = useCallback(
     (s: string) => {
@@ -443,6 +563,44 @@ export default function App() {
     },
     [scheduleSave],
   );
+
+  // Flush pending edits when the page goes away: app backgrounded (Android
+  // freezes the webview — the autosave timer never fires in the meantime),
+  // tab hidden, or the window closing.
+  useEffect(() => {
+    const onHide = () => {
+      if (document.visibilityState === "hidden") void flushSave();
+    };
+    const onPageHide = () => {
+      void flushSave();
+    };
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("pagehide", onPageHide);
+    return () => {
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("pagehide", onPageHide);
+    };
+  }, [flushSave]);
+
+  // Window close is intercepted on the Rust side (the CloseRequested window
+  // event handler in lib.rs): the close is prevented, "sn-before-close" is
+  // emitted, and the window is force-destroyed after a timeout if we never
+  // confirm. Flush here, then confirm with force_close so the last
+  // keystrokes always land on disk.
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    void listen("sn-before-close", () => {
+      void (async () => {
+        await flushSave();
+        await api.forceClose().catch(() => {});
+      })();
+    }).then((u) => {
+      un = u;
+    });
+    return () => {
+      void un?.();
+    };
+  }, [flushSave]);
 
   const openWikiTarget = useCallback(
     (target: string) => {
@@ -490,6 +648,8 @@ export default function App() {
       setNotes(res.notes);
       setPeers(res.peers);
       setFolders(res.folders);
+      // populate the sync footer (p2p settings + relay state)
+      void refresh();
       addLog(
         `vault opened: ${res.path} (P2P port ${res.p2p_port}, device ${res.device_name})`,
       );
@@ -763,6 +923,7 @@ export default function App() {
             transition (unmounting would kill the closing animation). */}
         <aside
           className={showSidebar ? "sidebar open" : "sidebar"}
+          style={{ "--sb-w": `${sidebarW}px` } as React.CSSProperties}
           onContextMenu={(e) => {
             // Notes/folders have their own menus (stopPropagation), inputs
             // keep the native one (copy/paste); anywhere else in the panel
@@ -784,12 +945,15 @@ export default function App() {
               top-right corner (on phones the panel covers the top bar,
               so the gear lives here, not in the header). */}
           <div className="side-top">
-            <input
-              className="inp"
-              placeholder="Search in text..."
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-            />
+            <div className="search">
+              <SearchIcon className="search-ico" />
+              <input
+                className="inp"
+                placeholder="Search in text..."
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+              />
+            </div>
             <button
               className="icon-btn"
               title={
@@ -803,7 +967,7 @@ export default function App() {
                 setDoc("");
               }}
             >
-              ✕
+              <CloseIcon />
             </button>
             <button
               className={showNet ? "icon-btn active" : "icon-btn"}
@@ -839,8 +1003,13 @@ export default function App() {
               onChange={(e) => setNewName(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && createNote()}
             />
-            <button onClick={createNote} disabled={!newName.trim()}>
-              +
+            <button
+              className="icon-btn"
+              title="Create note"
+              onClick={createNote}
+              disabled={!newName.trim()}
+            >
+              <PlusIcon />
             </button>
           </div>
           <div className="tree-wrap">
@@ -859,10 +1028,13 @@ export default function App() {
               onCreateFolder={doCreateFolder}
               onRenameFolder={doRenameFolder}
               onDeleteFolder={doDeleteFolder}
-             onMoveNote={(uuid, dir) => void doMoveNote(uuid, dir)}
-                onDeleteNote={(uuid) => void doDeleteNoteByUuid(uuid)}
-                onMoveFolder={(path, dir) => void doMoveFolder(path, dir)}
-            />
+               onMoveNote={(uuid, dir) => void doMoveNote(uuid, dir)}
+                 onDeleteNote={(uuid) => void doDeleteNoteByUuid(uuid)}
+                 onMoveFolder={(path, dir) => void doMoveFolder(path, dir)}
+                 deviceNames={deviceNames}
+                 conflictCount={conflictCount}
+                 onConflict={openConflict}
+             />
             {(query.trim() || activeTag) && (
               <button
                 className="wide"
@@ -887,19 +1059,59 @@ export default function App() {
             <div className="backlinks">
               <h3>Backlinks ({backlinks.length})</h3>
               {backlinks.map((b) => (
-                <button
-                  key={b.note.uuid}
-                  className="backlink"
-                  onClick={() => selectNote(b.note.uuid)}
-                  title={b.note.path}
-                >
-                  {b.note.path}
-                  {b.count > 1 && <span className="muted"> ×{b.count}</span>}
-                </button>
-              ))}
-            </div>
-          )}
-        </aside>
+                 <button
+                   key={b.note.uuid}
+                   className="backlink"
+                   onClick={() => selectNote(b.note.uuid)}
+                   title={b.note.path}
+                 >
+                   {b.note.path}
+                   {b.count > 1 && <span className="muted"> ×{b.count}</span>}
+                 </button>
+               ))}
+             </div>
+           )}
+           {/* Sync status footer: connection mode + last sync time + manual sync */}
+           <div className="sync-foot">
+             {ssOn ? (
+               <GlobeIcon className="sync-ico" />
+             ) : p2p?.p2p_running ? (
+               <WifiIcon className="sync-ico" />
+             ) : (
+               <WifiOffIcon className="sync-ico" />
+             )}
+             <span
+               className="muted sync-text"
+               title={
+                 ssOn
+                   ? "Syncing through the relay server"
+                   : p2p?.p2p_running
+                     ? "Direct sync on the local network (mDNS)"
+                     : "No sync connection"
+               }
+             >
+               {ssOn ? "Sync server" : p2p?.p2p_running ? "Local network" : "Offline"}
+               {p2p?.last_sync ? ` · ${formatWhen(p2p.last_sync * 1000)}` : ""}
+             </span>
+             <button
+               className="icon-btn"
+               title="Sync with all trusted devices now"
+               disabled={busy || !peers.length}
+               onClick={() => void doSyncAll()}
+             >
+               <SyncIcon />
+             </button>
+           </div>
+         </aside>
+
+         {/* Drag the divider to resize the notes list (double-click =
+             reset); desktop only, hidden while the panel is closed. */}
+         <div
+           className="resize-handle"
+           title="Drag to resize the notes list"
+           onPointerDown={startResize}
+           onDoubleClick={resetSidebarW}
+         />
 
         <main className="main">
           {/* Always-visible rail: hides/shows the notes list. Sits next to
@@ -914,7 +1126,7 @@ export default function App() {
             }
             onClick={() => setShowSidebar((v) => !v)}
           >
-            {showSidebar ? "‹" : "›"}
+            {showSidebar ? <ChevronLeftIcon /> : <ChevronRightIcon />}
           </button>
           <div className="main-content">
             {selected ? (
@@ -934,10 +1146,13 @@ export default function App() {
             </div>
           ) : (
             <div className="empty">
-              {showSidebar
-                ? "Select a note on the left or create a new one"
-                : "Press › on the left to open the notes list (swipe — on a phone)"}
-            </div>
+               <NoteIcon className="empty-ico" />
+               <div className="empty-text">
+                 {showSidebar
+                   ? "Select a note on the left or create a new one"
+                   : "Open the notes list from the left (swipe — on a phone)"}
+               </div>
+             </div>
           )}
             {error && <div className="error">{error}</div>}
           </div>
@@ -967,8 +1182,64 @@ export default function App() {
             onLive={setLive}
             noteFont={noteFont}
             onNoteFont={setNoteFont}
-            onClose={() => setShowNet(false)}
-          />
+          onClose={() => setShowNet(false)}
+           />
+        )}
+
+        {conflictView && (
+          <div
+            className="conflict-overlay"
+            onClick={(e) => {
+              if (e.target === e.currentTarget) closeConflict();
+            }}
+          >
+            <div className="conflict-card">
+              <div className="conflict-head">
+                <WarnIcon className="conflict-warn" size={16} />
+                <h2>Sync conflict</h2>
+                <button
+                  className="icon-btn"
+                  title="Close"
+                  onClick={closeConflict}
+                >
+                  <CloseIcon />
+                </button>
+              </div>
+              <div className="muted small">
+                {conflictView.note_path} — {conflictView.peer_name} ·{" "}
+                {formatWhen(conflictView.created_ms)}
+              </div>
+              <p className="muted small conflict-hint">
+                Both devices edited this note in ways that cannot be combined
+                automatically. Pick the version to keep — nothing is lost
+                until you decide.
+              </p>
+              <div className="conflict-version">
+                <div className="conflict-chip">This device</div>
+                <pre className="conflict-pre">
+                  {conflictParts ? conflictParts.ours : "loading…"}
+                </pre>
+                <button
+                  disabled={!conflictParts}
+                  onClick={() => void doResolveConflict(false)}
+                >
+                  Keep this version
+                </button>
+              </div>
+              <div className="conflict-version">
+                <div className="conflict-chip">{conflictView.peer_name}</div>
+                <pre className="conflict-pre">
+                  {conflictParts ? conflictParts.theirs : "loading…"}
+                </pre>
+                <button
+                  disabled={!conflictParts}
+                  onClick={() => void doResolveConflict(true)}
+                >
+                  Keep this version
+                </button>
+              </div>
+            </div>
+          </div>
         )}
       </div>
     </div>

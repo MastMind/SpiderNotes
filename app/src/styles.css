@@ -15,11 +15,20 @@
   --bg2: #1c1924;
   --bg3: #242030;
   --fg: #e8e4f0;
-  --muted: #8d86a0;
+  /* secondary text: kept at ~6:1 so the small (11px) labels stay legible
+     in dark mode (HIG floor is 4.5:1, 7:1 recommended for small type) */
+  --muted: #9791ab;
   --accent: #9d7cd8;
   --accent2: #6f57a8;
   --danger: #d87070;
+  --warn: #d8a35c;
   --border: #2e2940;
+  /* elevation: the chrome (top bar / sidebar / panel) sits one step above
+     the content, so it gets a soft shadow to "float" (Apple base/elevated) */
+  --lift: 0 1px 2px rgba(0, 0, 0, 0.28);
+  /* neutral hover surface (a step above --bg3); accent is reserved for
+     selection + primary actions, not every control's hover */
+  --hover: #2b2637;
 }
 
 /* "Note font" = Montserrat (bundled woff2) */
@@ -35,11 +44,14 @@
   --bg2: #ebe8f2;
   --bg3: #e0dcef;
   --fg: #262133;
-  --muted: #6f6884;
+  --muted: #615a76;
   --accent: #6d4ec2;
   --accent2: #8f76d2;
   --danger: #c05555;
+  --warn: #a86a1f;
   --border: #d3cde2;
+  --lift: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --hover: #d7d2e6;
 }
 
 :root[data-theme="midnight"] {
@@ -48,11 +60,14 @@
   --bg2: #131c2e;
   --bg3: #1b2942;
   --fg: #d8e2f4;
-  --muted: #7d8ba8;
+  --muted: #8a99b6;
   --accent: #6ea8fe;
   --accent2: #3a5d9c;
   --danger: #e0708a;
+  --warn: #d8a35c;
   --border: #24344f;
+  --lift: 0 1px 3px rgba(0, 0, 0, 0.38);
+  --hover: #22334f;
 }
 
 :root[data-theme="forest"] {
@@ -61,11 +76,14 @@
   --bg2: #17211b;
   --bg3: #1f2d24;
   --fg: #dfe8e1;
-  --muted: #82988a;
+  --muted: #8fa596;
   --accent: #7dc98f;
   --accent2: #46815a;
   --danger: #d88870;
+  --warn: #d8b05c;
   --border: #27392d;
+  --lift: 0 1px 3px rgba(0, 0, 0, 0.34);
+  --hover: #263629;
 }
 
 :root[data-theme="paper"] {
@@ -74,11 +92,14 @@
   --bg2: #efe7d7;
   --bg3: #e5dcc7;
   --fg: #33291b;
-  --muted: #7a6f5c;
+  --muted: #6a5f4b;
   --accent: #a05a2c;
   --accent2: #bf8348;
   --danger: #b05040;
+  --warn: #a06a20;
   --border: #d9cdb3;
+  --lift: 0 1px 2px rgba(0, 0, 0, 0.08);
+  --hover: #dcd2ba;
 }
 
 /* ---- Montserrat (Google Fonts, OFL) — bundled for offline use.
@@ -169,7 +190,7 @@ button {
   background: var(--bg3);
   color: var(--fg);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 8px;
   padding: 5px 10px;
   cursor: pointer;
   font-size: calc(var(--ui-fs) - 1px);
@@ -178,8 +199,8 @@ button {
 }
 
 button:hover:not(:disabled) {
-  background: var(--accent2);
-  border-color: var(--accent2);
+  background: var(--hover);
+  border-color: var(--border);
 }
 
 button:disabled {
@@ -200,7 +221,7 @@ button.danger {
   background: var(--bg2);
   border: 1px solid var(--border);
   color: var(--fg);
-  border-radius: 6px;
+  border-radius: 8px;
   padding: 6px 8px;
   font-size: calc(var(--ui-fs) - 1px);
   width: 100%;
@@ -216,7 +237,7 @@ button.danger {
 }
 
 .pad {
-  padding: 8px;
+  padding: 10px;
 }
 
 .error {
@@ -244,12 +265,12 @@ button.danger {
 .welcome-card {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
   width: 420px;
   background: var(--bg2);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 16px;
+  border-radius: 12px;
+  padding: 18px;
 }
 
 /* layout */
@@ -270,6 +291,7 @@ button.danger {
   padding: calc(8px + env(safe-area-inset-top, 0px)) 12px 8px;
   background: var(--bg2);
   border-bottom: 1px solid var(--border);
+  box-shadow: var(--lift);
 }
 
 .brand {
@@ -322,24 +344,40 @@ button.danger {
 }
 
 /* sidebar — slides left out of the window when closed. The MARGIN (not the
-   width) is animated, so the list keeps its 250px layout and the tree never
+   width) is animated, so the list keeps its width and the tree never
    reflows mid-animation; the editor fills the freed space in lockstep.
-   On mobile the same .open class drives a transform slide instead (see the
-   media query below). */
-.sidebar {
-  width: 250px;
-  min-width: 180px;
-  background: var(--bg2);
-  border-right: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  transition: margin-left 0.18s ease, opacity 0.15s ease;
-}
-.sidebar:not(.open) {
-  margin-left: -251px; /* width (250) + border (1): fully off-screen */
-  opacity: 0;
-  pointer-events: none;
-}
+   The width is user-resizable (--sb-w, set from the App via the drag
+   divider). On mobile the same .open class drives a transform slide
+   instead (see the media query below). */
+ .sidebar {
+   width: var(--sb-w, 250px);
+   min-width: 180px;
+   max-width: 420px;
+   background: var(--bg2);
+   border-right: 1px solid var(--border);
+   box-shadow: var(--lift);
+   display: flex;
+   flex-direction: column;
+   transition: margin-left 0.18s ease, opacity 0.15s ease;
+ }
+ .sidebar:not(.open) {
+   /* width + border: fully off-screen at ANY panel width */
+   margin-left: calc(-1 * var(--sb-w, 250px) - 1px);
+   opacity: 0;
+   pointer-events: none;
+ }
+
+ /* drag divider between the panel and the editor (desktop only) */
+ .resize-handle {
+   width: 6px;
+   flex-shrink: 0;
+   margin-left: -3px;
+   cursor: col-resize;
+   z-index: 5;
+ }
+ .sidebar:not(.open) + .resize-handle {
+   display: none;
+ }
 
 /* top row of the notes panel: search + note close + settings gear
    (the buttons sit in the panel's top-right corner) */
@@ -351,9 +389,29 @@ button.danger {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
-.side-top .inp {
+/* the search field is a pill with an inline magnifier (Apple Notes style);
+   the icon sits absolutely so the input keeps its own padding/placeholder */
+.search {
+  position: relative;
   flex: 1;
   min-width: 0;
+  display: flex;
+  align-items: center;
+}
+.search-ico {
+  position: absolute;
+  left: 10px;
+  width: 13px;
+  height: 13px;
+  color: var(--muted);
+  pointer-events: none;
+}
+.side-top .inp {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  padding-left: 30px;
+  border-radius: 999px;
 }
 .side-top button {
   flex-shrink: 0;
@@ -387,27 +445,100 @@ button.danger {
 }
 
 .tree-item {
-   display: block;
-   width: 100%;
-   text-align: left;
-   background: none;
-   border: none;
-   border-radius: 5px;
-   padding: 3px 6px;
-   color: var(--fg);
-   font-size: calc(var(--ui-fs) - 1px);
-   white-space: nowrap;
-   overflow: hidden;
-   text-overflow: ellipsis;
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 7px;
+    padding: 5px 8px;
+    color: var(--fg);
+    font-size: calc(var(--ui-fs) - 1px);
+    line-height: 1.3;
+   }
+
+ .tree-item:hover {
+   background: var(--bg3);
  }
 
-.tree-item:hover {
-  background: var(--bg3);
-}
+ .tree-item.sel {
+   background: var(--accent2);
+ }
 
-.tree-item.sel {
-  background: var(--accent2);
-}
+ /* Rich note row: bold title + muted preview, "device · time" at the right.
+    The ellipsis lives on the spans, not the button (which is now block
+    layout with flex children). */
+ .row-top {
+   display: flex;
+   align-items: baseline;
+   gap: 8px;
+ }
+
+ .row-title {
+   flex: 1;
+   font-weight: 600;
+   overflow: hidden;
+   text-overflow: ellipsis;
+   white-space: nowrap;
+ }
+
+ .row-meta {
+   flex-shrink: 0;
+   color: var(--muted);
+   font-size: calc(var(--ui-fs) - 3px);
+   white-space: nowrap;
+ }
+
+ .row-preview {
+     display: block;
+    color: var(--muted);
+    font-size: calc(var(--ui-fs) - 2px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Pending sync conflict: a small warning between the title and the meta */
+  .row-conflict {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    color: var(--warn);
+    cursor: pointer;
+  }
+
+  /* Sync status footer at the bottom of the notes panel: mode icon +
+     "mode · last sync" line + a manual-sync button. */
+  .sync-foot {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 8px 7px;
+    border-top: 1px solid var(--border);
+  }
+
+  .sync-ico {
+    flex-shrink: 0;
+    color: var(--muted);
+  }
+
+  .sync-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: calc(var(--ui-fs) - 2px);
+  }
+
+  .sync-foot .icon-btn {
+    flex-shrink: 0;
+    color: var(--muted);
+  }
+
+  .sync-foot .icon-btn:hover:not(:disabled) {
+    color: var(--fg);
+  }
 
 .tree-host {
   position: relative;
@@ -424,14 +555,14 @@ button.danger {
   color: var(--fg);
   font-size: calc(var(--ui-fs) - 2px);
   font-weight: 600;
-  padding: 3px 6px;
+  padding: 5px 8px;
   user-select: none;
   -webkit-touch-callout: none;
   touch-action: manipulation;
   display: flex;
   align-items: center;
-  gap: 5px;
-  border-radius: 5px;
+  gap: 6px;
+  border-radius: 7px;
 }
 
 .tree-dir:hover {
@@ -518,9 +649,9 @@ details[open] > summary.tree-dir .dir-chev {
   overflow-y: auto;
   background: var(--bg3);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 10px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-  padding: 4px;
+  padding: 5px;
 }
 
 .ctx-title {
@@ -949,9 +1080,26 @@ details[open] > summary.tree-dir .dir-chev {
 .empty {
   flex: 1;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
   color: var(--muted);
+}
+
+/* a large, quiet glyph anchors the empty (no note selected) state */
+.empty-ico {
+  width: 42px;
+  height: 42px;
+  color: var(--muted);
+  opacity: 0.55;
+}
+
+.empty-text {
+  max-width: 340px;
+  line-height: 1.5;
 }
 
 /* right panel */
@@ -960,6 +1108,7 @@ details[open] > summary.tree-dir .dir-chev {
   min-width: 220px;
   background: var(--bg2);
   border-left: 1px solid var(--border);
+  box-shadow: var(--lift);
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -990,7 +1139,7 @@ details[open] > summary.tree-dir .dir-chev {
 .panel .pad {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .peers {
@@ -1117,6 +1266,32 @@ details[open] > summary.tree-dir .dir-chev {
     word-break: break-all;
   }
 
+  /* Short comparison codes (trust-by-comparison): big, spaced glyphs the
+     user reads off the other screen. */
+  .self-code {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+
+  .self-code-val,
+  .trust-code {
+    font-family: ui-monospace, "Cascadia Mono", monospace;
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: 3px;
+    color: var(--fg);
+  }
+
+  .trust-code {
+    color: var(--accent);
+  }
+
+  .peer-code {
+    margin-left: 4px;
+    letter-spacing: 1px;
+  }
+
  .peer-meta {
    min-width: 0;
  }
@@ -1193,6 +1368,9 @@ details[open] > summary.tree-dir .dir-chev {
   .side-rail {
     display: none;
   }
+  .resize-handle {
+    display: none; /* the panel is a full-screen overlay — nothing to resize */
+  }
   /* панель настроек — поверх контента, а не третья колонка: на узком
      экране три колонки (список + редактор + панель) не помещаются, и
      виджеты наслаивались друг на друга */
@@ -1233,4 +1411,87 @@ details[open] > summary.tree-dir .dir-chev {
   .sidebar {
     transition: none;
   }
+}
+
+/* ---- sync conflict panel (three-way merge leftovers) ----
+   Centered card over a dimmed backdrop: both versions side by side,
+   each with a "keep this version" decision. */
+.conflict-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 50;
+}
+
+.conflict-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--lift);
+  width: min(680px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-family: var(--font-sans);
+}
+
+.conflict-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.conflict-head h2 {
+  flex: 1;
+  margin: 0;
+  font-size: calc(var(--ui-fs) + 2px);
+  font-weight: 600;
+}
+
+.conflict-warn {
+  color: var(--warn);
+}
+
+.conflict-hint {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.conflict-version {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.conflict-chip {
+  align-self: flex-start;
+  font-size: calc(var(--ui-fs) - 2px);
+  font-weight: 600;
+  color: var(--fg);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+
+.conflict-pre {
+  margin: 0;
+  font-family: var(--note-font);
+  font-size: calc(var(--ui-fs) - 2px);
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow-y: auto;
 }

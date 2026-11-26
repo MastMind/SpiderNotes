@@ -15,6 +15,7 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { extname } from "node:path";
 import path from "node:path";
+import { createHash } from "node:crypto";
 
 // Run: node app/scripts/check-design.mjs
 import { fileURLToPath } from "node:url";
@@ -29,26 +30,81 @@ try {
 }
 const LONG = "x".repeat(400);
 const hlc = { ms: 1, counter: 0, device: "local" };
+// fixed "last sync" moment for the footer check (14.11.2023 22:13 UTC)
+const LAST_SYNC = 1700000000;
+const mockPeer = {
+  name: "peer",
+  device_id: "p2p00000-0000-0000-0000-000000000001",
+  x25519_pub: [],
+  address: "127.0.0.1",
+  port: 8788,
+};
+// same comparison-code derivation as the app (PeersPanel.useCodes):
+// first 5 SHA-256 bytes -> 6 Crockford-base32 chars
+const CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const codeFor = (id) => {
+  const b = createHash("sha256").update(id).digest().subarray(0, 5);
+  let bits = 0;
+  for (const x of b) bits = (bits << 8) | x;
+  let out = "";
+  for (let g = 5; g >= 0; g--) out += CODE_ALPHABET[(bits >> (g * 5)) & 31];
+  return out;
+};
+// "#rrggbb" -> "rgb(r, g, b)" (null when not a 7-char hex color)
+const toRgb = (hex) => hex && hex.startsWith("#") && hex.length === 7
+  ? `rgb(${parseInt(hex.slice(1,3),16)}, ${parseInt(hex.slice(3,5),16)}, ${parseInt(hex.slice(5,7),16)})`
+  : null;
+// same "when" formatting as the app (NotesTree.formatWhen)
+const fmtWhen = (ms) => {
+  const d = new Date(ms), now = new Date();
+  if (d.toDateString() === now.toDateString())
+    return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  const opts = d.getFullYear() === now.getFullYear()
+    ? { day: "2-digit", month: "2-digit" }
+    : { day: "2-digit", month: "2-digit", year: "2-digit" };
+  return d.toLocaleDateString("ru-RU", opts);
+};
 const notesList = [
-  { uuid: "long0000-0000-0000-0000-000000000001", path: "long.md", hlc, hash: "", deleted: false },
-  { uuid: "fold0000-0000-0000-0000-000000000002", path: "work/idea.md", hlc, hash: "", deleted: false },
+  // title/preview as computed by the backend from the note bodies below
+  // (long.md has no heading -> first line is the title; idea.md is one line)
+  { uuid: "long0000-0000-0000-0000-000000000001", path: "long.md", hlc, hash: "", deleted: false, title: "line one", preview: "x".repeat(80) + "…" },
+  { uuid: "fold0000-0000-0000-0000-000000000002", path: "work/idea.md", hlc, hash: "", deleted: false, title: "body of work/idea.md", preview: "" },
 ];
+
+// a pending sync conflict on long.md (the row gets a warning icon; the
+ // panel offers both versions; resolve empties the list)
+const mockConflict = {
+  id: "conflict-1",
+  note_uuid: "long0000-0000-0000-0000-000000000001",
+  note_path: "long.md",
+  peer_name: "peer",
+  peer_id: "p2p00000-0000",
+  created_ms: LAST_SYNC * 1000,
+  our_hash: "o",
+  their_hash: "t",
+  their_hlc: { ms: LAST_SYNC * 1000, counter: 0, device: "p2p00000-0000" },
+  their_title: "peer title",
+  their_preview: "",
+};
+const THEIR_CONTENT = "PEER VERSION of long.md";
 
 let mockSource = "";
 const mock = (extra) => `
 window.__invokeLog = [];
 window.__invokeArgs = [];
 window.__mockNotesList = ${JSON.stringify(notesList)};
+window.__mockConflicts = [${JSON.stringify(mockConflict)}];
 const hlc = ${JSON.stringify(hlc)};
 ${extra || ""}
 window.__TAURI_INTERNALS__ = {
   invoke: async (cmd, args) => {
     window.__invokeLog.push(cmd);
+    window.__invokeArgs.push([cmd, args]);
     switch (cmd) {
       case "vault_status": return null;
       case "default_vault_path": return "/mock/vault";
       case "open_vault":
-        return { path: "/mock/vault", p2p_port: 8788, device_id: "localdev", device_name: "mock", notes: window.__mockNotesList, peers: [], folders: ["work"] };
+        return { path: "/mock/vault", p2p_port: 8788, device_id: "localdev", device_name: "mock", notes: window.__mockNotesList, peers: [${JSON.stringify(mockPeer)}], folders: ["work"] };
       case "list_notes": return window.__mockNotesList;
       case "list_folders": return ["work"];
       case "read_note": {
@@ -67,9 +123,13 @@ window.__TAURI_INTERNALS__ = {
       case "device_info": return { id: "localdev", name: "mock" };
       case "list_peers": return [];
       case "list_trusted": return [];
-      case "p2p_settings": return { autosync_secs: 30, p2p_port: 8788, p2p_port_setting: 8788, p2p_running: true };
-      case "server_sync_status": return { status: "server sync is off" };
-      default: return null;
+      case "p2p_settings": return { autosync_secs: 30, p2p_port: 8788, p2p_port_setting: 8788, p2p_running: true, last_sync: ${LAST_SYNC} };
+       case "server_sync_status": return { enabled: false, connected: false, status: "server sync is off" };
+       case "sync_all": return [];
+       case "list_conflicts": return window.__mockConflicts;
+       case "conflict_content": return ${JSON.stringify(THEIR_CONTENT)};
+       case "resolve_conflict": window.__mockConflicts = []; return null;
+       default: return null;
     }
   },
   transformCallback: (cb) => {
@@ -237,6 +297,87 @@ check("fonts: editor + notes tree stay monospace",
   /monospace/.test(fonts.tree) && !/Montserrat/.test(fonts.tree),
   `editor=${fonts.editor} tree=${fonts.tree}`);
 
+// ============ save on hide/exit: pending edits must land on disk ============
+// The autosave debounce is 2s; pagehide, visibilitychange->hidden (app
+// backgrounded) and the window-close handshake (sn-before-close ->
+// force_close) must flush the pending edit immediately. long.md is open;
+// the cursor sits at pos 0, so each insertText prefixes the content.
+await evalJs(`(() => { document.querySelector(".cm-content").focus(); return "focused"; })()`);
+await send("Input.insertText", { text: " pagehide" });
+await sleep(300);
+const ph0 = await evalJs(`window.__invokeLog.filter((c) => c === "save_note").length`);
+check("save on hide: nothing saved before the 2s debounce elapses", ph0 === 0, `saves=${ph0}`);
+await evalJs(`window.dispatchEvent(new Event("pagehide"))`);
+await sleep(400);
+const ph1 = await evalJs(`(() => {
+  const args = window.__invokeArgs.filter(([c]) => c === "save_note").map(([, a]) => a.content);
+  return { saves: window.__invokeLog.filter((c) => c === "save_note").length, last: args[args.length - 1] || "" };
+})()`);
+check("save on hide: pagehide flushes the pending edit",
+  ph1.saves === 1 && ph1.last.startsWith(" pagehide"), JSON.stringify(ph1));
+
+// window close: the Rust side intercepts the close and emits sn-before-close;
+// the frontend flushes and confirms with force_close (simulate the emit)
+await send("Input.insertText", { text: " closing" });
+await sleep(200);
+const cl0 = await evalJs(`(() => {
+  const hit = window.__invokeArgs.find(([c, a]) => c === "plugin:event|listen" && a.event === "sn-before-close");
+  if (!hit) return "no listener";
+  window.__cbs[hit[1].handler]({ event: "sn-before-close", id: hit[1].handler, payload: null });
+  return "emitted";
+})()`);
+await sleep(500);
+const cl1 = await evalJs(`(() => {
+  const args = window.__invokeArgs.filter(([c]) => c === "save_note").map(([, a]) => a.content);
+  return {
+    saves: window.__invokeLog.filter((c) => c === "save_note").length,
+    forced: window.__invokeLog.includes("force_close"),
+    last: args[args.length - 1] || "",
+  };
+})()`);
+check("save on exit: sn-before-close flushes the pending edit",
+  cl0 === "emitted" && cl1.saves === 2 && cl1.last.startsWith(" pagehide closing"),
+  `${cl0} ${JSON.stringify(cl1)}`);
+check("save on exit: force_close confirms the window destroy", cl1.forced);
+
+// app backgrounded (Android freezes the webview): visibilitychange -> hidden
+await send("Input.insertText", { text: " hidden" });
+await sleep(200);
+await evalJs(`(() => {
+  const orig = Object.getOwnPropertyDescriptor(Document.prototype, "visibilityState");
+  Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+  document.dispatchEvent(new Event("visibilitychange"));
+  Object.defineProperty(document, "visibilityState", orig);
+  return "hidden";
+})()`);
+await sleep(400);
+const hv = await evalJs(`(() => {
+  const args = window.__invokeArgs.filter(([c]) => c === "save_note").map(([, a]) => a.content);
+  return { saves: window.__invokeLog.filter((c) => c === "save_note").length, last: args[args.length - 1] || "" };
+})()`);
+check("save on hide: visibilitychange->hidden flushes the pending edit",
+  hv.saves === 3 && hv.last.startsWith(" pagehide closing hidden"), JSON.stringify(hv));
+
+// sync footer: connection mode + last sync time + manual sync button
+const sf0 = await evalJs(`(() => {
+  const f = document.querySelector(".sync-foot");
+  if (!f) return null;
+  const btn = f.querySelector("button.icon-btn");
+  return {
+    text: f.querySelector(".sync-text")?.textContent.trim(),
+    hasIco: !!f.querySelector(".sync-ico"),
+    btnEnabled: btn ? !btn.disabled : null,
+  };
+})()`);
+check("sync footer: local network mode + last sync time",
+  sf0 !== null && sf0.hasIco && sf0.text === `Local network · ${fmtWhen(LAST_SYNC * 1000)}`,
+  JSON.stringify(sf0));
+check("sync footer: sync button enabled when peers are present", sf0?.btnEnabled === true);
+await evalJs(`(() => { document.querySelector(".sync-foot button.icon-btn").click(); return "clicked"; })()`);
+await sleep(300);
+const sf1 = await evalJs(`window.__invokeLog.includes("sync_all")`);
+check("sync footer: sync button triggers sync_all", sf1 === true);
+
 // sidebar slide: rail closes it (slides off-screen, editor widens) and
 // opens it back (slides in, editor returns to its width)
 const rail0 = await evalJs(`(() => {
@@ -273,6 +414,108 @@ check("sidebar: opening slides it back (editor width restored)",
   sbOpen.left === 0 && sbOpen.width > 200 && sbOpen.opacity === "1" && Math.abs(sbOpen.main - rail0) < 2,
   JSON.stringify(sbOpen));
 
+// resizable sidebar: drag the divider (clamped 180..420, persisted,
+// double-click resets)
+const rhAt = () => evalJs(`(() => {
+  const r = document.querySelector(".resize-handle").getBoundingClientRect();
+  return { x: r.x + r.width / 2, y: 300 };
+})()`);
+const mouse = (type, x, y, clickCount = 1) =>
+  send("Input.dispatchMouseEvent", { type, x, y, button: "left", buttons: type === "mouseMoved" ? 1 : undefined, clickCount });
+const rh0 = await evalJs(`(() => ({
+  cursor: getComputedStyle(document.querySelector(".resize-handle")).cursor,
+  sbw: getComputedStyle(document.querySelector(".sidebar")).width,
+}))()`);
+check("resize: handle present with col-resize cursor, panel 250px",
+  rh0.cursor === "col-resize" && rh0.sbw === "250px", JSON.stringify(rh0));
+{
+  const p = await rhAt();
+  await mouse("mousePressed", p.x, p.y);
+  await mouse("mouseMoved", p.x + 50, p.y);
+  await mouse("mouseReleased", p.x + 50, p.y);
+  await sleep(150);
+}
+const rh1 = await evalJs(`(() => ({
+  sbw: getComputedStyle(document.querySelector(".sidebar")).width,
+  ls: localStorage.getItem("sn.sidebarW"),
+}))()`);
+check("resize: dragging the divider widens the panel and persists",
+  rh1.sbw === "300px" && rh1.ls === "300", JSON.stringify(rh1));
+{
+  const p = await rhAt();
+  await mouse("mousePressed", p.x, p.y);
+  await mouse("mouseMoved", 3000, p.y); // way past the max
+  await mouse("mouseReleased", 3000, p.y);
+  await sleep(150);
+}
+const rh2 = await evalJs(`getComputedStyle(document.querySelector(".sidebar")).width`);
+check("resize: width is clamped to the 420px max", rh2 === "420px", rh2);
+{
+  const p = await rhAt();
+  await mouse("mousePressed", p.x, p.y);
+  await mouse("mouseReleased", p.x, p.y);
+  await mouse("mousePressed", p.x, p.y, 2);
+  await mouse("mouseReleased", p.x, p.y, 2);
+  await sleep(150);
+}
+const rh3 = await evalJs(`(() => ({
+   sbw: getComputedStyle(document.querySelector(".sidebar")).width,
+   ls: localStorage.getItem("sn.sidebarW"),
+ }))()`);
+check("resize: double-click on the divider resets to 250px",
+  rh3.sbw === "250px" && rh3.ls === "250", JSON.stringify(rh3));
+
+// sync conflict: the note row carries a warning icon (warn color); it opens
+// the conflict panel with BOTH versions; resolving keeps the chosen one
+const cf0 = await evalJs(`(() => {
+  const ico = document.querySelector('button.tree-item[title="long.md"] .row-conflict');
+  return {
+    has: !!ico,
+    color: ico ? getComputedStyle(ico).color : null,
+    warn: getComputedStyle(document.documentElement).getPropertyValue("--warn").trim(),
+  };
+})()`);
+check("conflict: note row shows a warning icon in the warn color",
+  cf0.has && toRgb(cf0.warn) !== null && cf0.color === toRgb(cf0.warn),
+  JSON.stringify(cf0));
+await evalJs(`(() => {
+  document.querySelector('button.tree-item[title="long.md"] .row-conflict').click();
+  return "x";
+})()`);
+await sleep(600);
+const cf1 = await evalJs(`(() => {
+  const card = document.querySelector(".conflict-card");
+  if (!card) return null;
+  return {
+    head: card.querySelector("h2")?.textContent,
+    chips: Array.from(card.querySelectorAll(".conflict-chip")).map((c) => c.textContent.trim()),
+    pre: Array.from(card.querySelectorAll(".conflict-pre")).map((p) => p.textContent),
+    btns: Array.from(card.querySelectorAll(".conflict-version > button")).map((b) => ({ t: b.textContent.trim(), dis: b.disabled })),
+  };
+})()`);
+check("conflict: panel shows both versions (this device + peer)",
+  cf1 !== null && cf1.head === "Sync conflict" &&
+  JSON.stringify(cf1.chips) === JSON.stringify(["This device", "peer"]) &&
+  cf1.pre.length === 2 && cf1.pre[0].startsWith("line one") &&
+  cf1.pre[1] === "PEER VERSION of long.md",
+  JSON.stringify(cf1));
+check("conflict: each version has an enabled 'Keep this version' button",
+  cf1?.btns.length === 2 &&
+  cf1.btns.every((b) => b.t === "Keep this version" && b.dis === false));
+await evalJs(`(() => {
+  document.querySelectorAll(".conflict-version > button")[1].click();
+  return "clicked";
+})()`);
+await sleep(700);
+const cf2 = await evalJs(`(() => ({
+  resolved: window.__invokeArgs.some(([c, a]) => c === "resolve_conflict" && a.keepTheirs === true),
+  closed: !document.querySelector(".conflict-card"),
+  iconGone: !document.querySelector('button.tree-item[title="long.md"] .row-conflict'),
+}))()`);
+check("conflict: 'keep peer version' calls resolve_conflict and closes the panel",
+  cf2.resolved && cf2.closed, JSON.stringify(cf2));
+check("conflict: row warning disappears after resolving", cf2.iconGone);
+
 // folder icon
 const fi = await evalJs(`(() => {
   const sum = document.querySelector("summary.tree-dir");
@@ -288,14 +531,11 @@ const fi = await evalJs(`(() => {
     closedDisplay: closed,
     openDisplay: open,
     isOpen: details.open,
-    color: getComputedStyle(sum.querySelector(".dir-icon")).color,
-    accent: getComputedStyle(document.documentElement).getPropertyValue("--accent").trim(),
-    fg: getComputedStyle(sum).color,
+ color: getComputedStyle(sum.querySelector(".dir-icon")).color,
+   accent: getComputedStyle(document.documentElement).getPropertyValue("--accent").trim(),
+   fg: getComputedStyle(sum).color,
   };
 })()`);
-const toRgb = (hex) => hex && hex.startsWith("#") && hex.length === 7
-  ? `rgb(${parseInt(hex.slice(1,3),16)}, ${parseInt(hex.slice(3,5),16)}, ${parseInt(hex.slice(5,7),16)})`
-  : null;
 check("folder icon: SVG rendered, no emoji", fi.hasSvg && !fi.emoji, JSON.stringify(fi));
 check("folder icon: open state shows open variant", fi.isOpen ? fi.openDisplay !== "none" && fi.closedDisplay === "none" : fi.closedDisplay !== "none", `open=${JSON.stringify(fi)}`);
 check("folder icon: colored with the theme accent", toRgb(fi.accent) !== null && fi.color === toRgb(fi.accent) && fi.color !== fi.fg, `icon=${fi.color} accent=${fi.accent}`);
@@ -307,6 +547,35 @@ const ds = await evalJs(`(() => {
   return "gear clicked";
 })()`);
 await sleep(600);
+
+// comparison codes: my code in "My device", peer code in the row + confirm box
+const cc0 = await evalJs(`(() => ({
+  self: document.querySelector(".self-code-val")?.textContent.trim(),
+  peerRow: document.querySelector(".peer-code")?.textContent.trim(),
+}))()`);
+check("comparison code: my device shows a 6-char code",
+  cc0.self !== undefined && cc0.self === codeFor("localdev"), JSON.stringify(cc0));
+check("comparison code: peer row shows the peer's code",
+  cc0.peerRow === "· " + codeFor(mockPeer.device_id), JSON.stringify(cc0));
+await evalJs(`(() => {
+  const t = Array.from(document.querySelectorAll("button.trust")).find(b => b.textContent.trim() === "Trust");
+  if (t) t.click();
+  return !!t;
+})()`);
+await sleep(300);
+const cc1 = await evalJs(`(() => ({
+  code: document.querySelector(".trust-code")?.textContent.trim(),
+  id: document.querySelector(".trust-confirm .trust-id")?.textContent.trim(),
+}))()`);
+check("trust confirm: short code + full ID for comparison",
+  cc1.code === codeFor(mockPeer.device_id) && cc1.id === mockPeer.device_id,
+  JSON.stringify(cc1));
+await evalJs(`(() => {
+  const c = Array.from(document.querySelectorAll(".trust-confirm .peer-actions button")).find(b => b.textContent.trim() === "Cancel");
+  if (c) c.click();
+  return !!c;
+})()`);
+await sleep(200);
 const d1 = await evalJs(`(() => {
   const btn = Array.from(document.querySelectorAll("button")).find(b => /visual settings/i.test(b.textContent));
   if (!btn) return { found: false };
@@ -459,8 +728,12 @@ await loadWith(`
 localStorage.removeItem("sn.showSidebar");
 localStorage.removeItem("sn.showNet"); // scenario 1 left the panel open
 `, URL);
-const railHidden = await evalJs(`getComputedStyle(document.querySelector(".side-rail")).display === "none"`);
-check("mobile: the rail button is hidden", railHidden);
+const railHidden = await evalJs(`(() => ({
+  rail: getComputedStyle(document.querySelector(".side-rail")).display,
+  handle: getComputedStyle(document.querySelector(".resize-handle")).display,
+}))()`);
+check("mobile: the rail button and the resize handle are hidden",
+  railHidden.rail === "none" && railHidden.handle === "none", JSON.stringify(railHidden));
 // open with a right swipe from the MIDDLE of the screen (the whole screen
 // is the trigger area on phones)
 const swipeOpen = await evalJs(`(() => {

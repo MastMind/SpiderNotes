@@ -3,7 +3,8 @@ mod server_sync;
 mod state;
 
 use state::AppState;
-use tauri::Manager;
+use std::time::Duration;
+use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -63,6 +64,26 @@ pub fn run() {
                     }
                 });
             }
+            // Close the window only after the frontend has flushed pending
+            // edits: prevent the close, ask it to save ("sn-before-close"),
+            // and force-destroy after a timeout if it never confirms (the
+            // normal path is the force_close command right after the flush;
+            // destroy() does not re-emit CloseRequested, so no loop).
+            if let Some(win) = app.get_webview_window("main") {
+                let ask = win.clone();
+                let killer = win.clone();
+                win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = ask.emit("sn-before-close", ());
+                        let w = killer.clone();
+                        tauri::async_runtime::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            let _ = w.destroy();
+                        });
+                    }
+                });
+            }
             Ok(())
         })
         .plugin(spidernotes_fgservice::init())
@@ -98,7 +119,11 @@ pub fn run() {
             commands::set_p2p_port_setting,
             commands::restart_p2p,
             commands::set_server_sync,
-            commands::server_sync_status
+            commands::server_sync_status,
+            commands::list_conflicts,
+            commands::conflict_content,
+            commands::resolve_conflict,
+            commands::force_close
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

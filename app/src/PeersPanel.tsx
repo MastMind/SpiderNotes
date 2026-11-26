@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import * as api from "./api";
 import type { PeerInfo, TrustedDevice } from "./types";
 import { THEMES } from "./themes";
+import { CheckIcon, CloseIcon } from "./icons";
 
 // Background sync (the Android foreground service) only exists on Android;
 // hide its toggle everywhere else. Tauri's Android webview is Chromium, so
@@ -11,6 +12,53 @@ const IS_ANDROID = /android/i.test(navigator.userAgent);
 function shortId(id: string): string {
   if (id.length <= 16) return id;
   return `${id.slice(0, 8)}…${id.slice(-4)}`;
+}
+
+// Short comparison code for trust-by-comparison: 6 chars (30 bits) derived
+// from the device id, so a user compares a handful of glyphs instead of 64
+// hex chars. Crockford alphabet (no I/L/O/U) to keep the glyphs
+// unambiguous. Both devices compute the same code from the same id, so the
+// check stays mutual: each user reads the code OFF THE OTHER SCREEN and
+// compares it with the code shown in their own list. (It is a
+// transcription-error aid, not extra crypto — the Noise protocol does the
+// real authentication.)
+const CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+function shortCode(hash: Uint8Array): string {
+  let bits = 0;
+  for (let i = 0; i < 5; i++) bits = (bits << 8) | hash[i];
+  let out = "";
+  for (let g = 5; g >= 0; g--) out += CODE_ALPHABET[(bits >> (g * 5)) & 31];
+  return out;
+}
+
+// device id -> comparison code (SHA-256 based, WebCrypto; empty when the
+// context has no subtle crypto, e.g. plain http)
+function useCodes(ids: string[]): Record<string, string> {
+  const [codes, setCodes] = useState<Record<string, string>>({});
+  const key = ids.join("|");
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const out: Record<string, string> = {};
+      for (const id of new Set(key ? key.split("|") : [])) {
+        try {
+          const buf = await crypto.subtle.digest(
+            "SHA-256",
+            new TextEncoder().encode(id)
+          );
+          out[id] = shortCode(new Uint8Array(buf));
+        } catch {
+          // no WebCrypto in this context — the code line simply stays hidden
+        }
+      }
+      if (!cancelled) setCodes(out);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [key]);
+  return codes;
 }
 
 async function copyText(s: string): Promise<void> {
@@ -65,6 +113,11 @@ export function PeersPanel(props: {
   onClose?: () => void;
 }) {
   const logRef = useRef<HTMLDivElement>(null);
+  // comparison codes for my device + every listed peer
+  const codes = useCodes([
+    props.deviceId,
+    ...props.peers.map((p) => p.device_id),
+  ]);
   const [trusted, setTrusted] = useState<TrustedDevice[]>([]);
   const [autosyncSecs, setAutosyncSecs] = useState(30);
   const [autosaveDraft, setAutosaveDraft] = useState(props.autosaveSecs);
@@ -260,7 +313,7 @@ export function PeersPanel(props: {
     <aside className="panel">
       {props.onClose && (
         <button className="close-panel" title="Close" onClick={props.onClose}>
-          ✕
+          <CloseIcon />
         </button>
       )}
       <h2>My device</h2>
@@ -269,6 +322,15 @@ export function PeersPanel(props: {
         <div className="muted small" title={props.deviceId}>
           <IdChip id={props.deviceId} />
         </div>
+        {codes[props.deviceId] && (
+          <div
+            className="self-code"
+            title="This device's comparison code — the other user compares it with the code in their own peer list"
+          >
+            <span className="muted small">code</span>
+            <span className="self-code-val">{codes[props.deviceId]}</span>
+          </div>
+        )}
         <div className="muted small">
           Sync works with trusted devices only
         </div>
@@ -290,8 +352,8 @@ export function PeersPanel(props: {
         )}
         {props.peers.length > 0 && (
           <div className="muted small">
-            Sync works after "Trust" on both devices (the ID to compare is
-            shown in the confirm box)
+            Sync works after "Trust" on both devices (compare the short code
+            shown on each screen)
           </div>
         )}
         {props.peers.map((p) => {
@@ -301,7 +363,8 @@ export function PeersPanel(props: {
             <div key={p.device_id} className="peer">
               <div className="peer-meta">
                 <div className="peer-name">
-                  {p.name} {trusted && <span className="trust-badge">✓</span>}{" "}
+                  {p.name}{" "}
+                  {trusted && <CheckIcon className="trust-badge" size={12} />}{" "}
                   {p.via_server && (
                     <span
                       className="trust-badge"
@@ -316,6 +379,14 @@ export function PeersPanel(props: {
                 </div>
                 <div className="muted small">
                   <IdChip id={p.device_id} />
+                  {codes[p.device_id] && (
+                    <span
+                      className="peer-code"
+                      title="this device's comparison code — compare it with the code shown on that device"
+                    >
+                      · {codes[p.device_id]}
+                    </span>
+                  )}
                 </div>
               </div>
               <div className="peer-actions">
@@ -328,7 +399,13 @@ export function PeersPanel(props: {
                   className={trusted ? "trust on" : "trust"}
                   onClick={() => askTrust(p)}
                 >
-                  {trusted ? "Trusted ✓" : "Trust"}
+                  {trusted ? (
+                    <>
+                      Trusted <CheckIcon size={12} />
+                    </>
+                  ) : (
+                    "Trust"
+                  )}
                 </button>
                 <button
                   disabled={props.busy || !trusted}
@@ -338,23 +415,33 @@ export function PeersPanel(props: {
                   Sync
                 </button>
               </div>
-              {confirming && (
-                <div className="trust-confirm">
-                  <div className="muted small">
-                    Trust "{p.name}"? Compare the ID with the one shown on
-                    that device:
+    {confirming && (
+                  <div className="trust-confirm">
+                    <div className="muted small">
+                      Trust "{p.name}"? Compare the code below with the one
+                      shown on that device (full ID under it):
+                    </div>
+                    {codes[p.device_id] && (
+                      <div
+                        className="trust-code"
+                        title="short comparison code of that device"
+                      >
+                        {codes[p.device_id]}
+                      </div>
+                    )}
+                    <div className="muted small trust-id" title="full device ID (tap to copy)">
+                      {p.device_id}
+                    </div>
+                    <div className="peer-actions">
+                      <button className="trust on" onClick={confirmTrust}>
+                        Confirm
+                      </button>
+                      <button onClick={() => setConfirmPeer(null)}>
+                        Cancel
+                      </button>
+                    </div>
                   </div>
-                  <div className="muted small trust-id">{p.device_id}</div>
-                  <div className="peer-actions">
-                    <button className="trust on" onClick={confirmTrust}>
-                      Confirm
-                    </button>
-                    <button onClick={() => setConfirmPeer(null)}>
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              )}
+                )}
             </div>
           );
         })}

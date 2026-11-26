@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  Conflict,
   DeviceInfo,
   Note,
   Backlink,
@@ -63,3 +64,13 @@ export const setServerSync = (
   secret: string
 ) => invoke<ServerSyncStatus>("set_server_sync", { enabled, host, port, room, secret });
 export const serverSyncStatus = () => invoke<ServerSyncStatus>("server_sync_status");
+// Confirms the close-request flush (see the CloseRequested handler in
+// lib.rs); the Rust side force-destroys the window after a timeout if
+// this never comes.
+export const forceClose = () => invoke<void>("force_close");
+export const listConflicts = () =>
+  invoke<Conflict[]>("list_conflicts");
+export const conflictContent = (id: string) =>
+  invoke<string>("conflict_content", { id });
+export const resolveConflict = (id: string, keepTheirs: boolean) =>
+  invoke<void>("resolve_conflict", { id, keepTheirs });

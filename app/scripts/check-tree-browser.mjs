@@ -29,17 +29,45 @@ try {
 const realNotes = {
   "root.md": "---\nspidernotes-id: n0000000-0000-0000-0000-000000000001\n---\n\n# root\n",
   "work/idea.md": "---\nspidernotes-id: n0000000-0000-0000-0000-000000000002\n---\n\n# idea\n",
-  "work/meeting.md": "---\nspidernotes-id: n0000000-0000-0000-0000-000000000003\n---\n\n# meeting\n",
+  "work/meeting.md": "---\nspidernotes-id: n0000000-0000-0000-0000-000000000003\n---\n\n# meeting\nWeekly sync notes\n",
   "home/recipe.md": "---\nspidernotes-id: n0000000-0000-0000-0000-000000000004\n---\n\n# recipe\n",
 };
 const mockFolders = ["work", "home", "empty-folder"];
 const hlc = { ms: 1, counter: 0, device: "local" };
+// JS port of crates/core title_preview(): first ATX heading, else the first
+// non-empty line after the frontmatter; preview = next non-empty line
+// (whitespace collapsed, capped at 80 chars + …).
+function titlePreview(content) {
+  let body = content.split("\n");
+  if (content.startsWith("---")) {
+    const end = body.findIndex((l, i) => i > 0 && l.trim() === "---");
+    if (end >= 0) body = body.slice(end + 1);
+  }
+  let ti = -1;
+  for (let i = 0; i < body.length; i++) {
+    if (/^\s*#{1,6}(?:$|[\s\t])/.test(body[i])) { ti = i; break; }
+  }
+  if (ti < 0) ti = body.findIndex((l) => l.trim() !== "");
+  if (ti < 0) return { title: "", preview: "" };
+  let title = body[ti].trimStart().replace(/^#+[\s\t]?/, "").replace(/#+\s*$/, "").trim();
+  let preview = "";
+  for (let i = ti + 1; i < body.length; i++) {
+    if (body[i].trim()) {
+      preview = body[i].trim().split(/\s+/).join(" ");
+      const chars = [...preview];
+      if (chars.length > 80) preview = chars.slice(0, 80).join("") + "…";
+      break;
+    }
+  }
+  return { title, preview };
+}
 const notesList = Object.entries(realNotes).map(([p, content]) => ({
   uuid: content.match(/spidernotes-id:\s*(\S+)/)?.[1] ?? p,
   path: p,
   hlc,
   hash: "",
   deleted: false,
+  ...titlePreview(content),
 }));
 
 const mock = `
@@ -81,7 +109,8 @@ window.__TAURI_INTERNALS__ = {
       case "untrust_device": return [];
       case "sync_with": return { peer_name: "?", sent: 0, applied: 0, skipped: 0 };
       case "sync_all": return [];
-      case "p2p_settings": return { autosync_secs: 30, p2p_port: 8788, p2p_port_setting: 8788, p2p_running: true };
+      case "p2p_settings": return { autosync_secs: 30, p2p_port: 8788, p2p_port_setting: 8788, p2p_running: true, last_sync: null };
+      case "server_sync_status": return { enabled: false, connected: false, status: "server sync is off" };
       case "set_bg_sync": return null;
       case "set_autosync_secs": return args.secs;
       case "set_p2p_port_setting": return args.port;
@@ -187,7 +216,7 @@ const opened = await evalJs(`(() => {
 if (opened !== "clicked") { console.log("FAIL: vault button not found"); process.exit(1); }
 await sleep(1500);
 
-// ---- 1. folders render, .md hidden, counts ----
+// ---- 1. folders render, .md hidden, counts, rich rows ----
 const t1 = await evalJs(`(() => {
   const dirs = Array.from(document.querySelectorAll("summary.tree-dir"));
   const dirNames = dirs.map(d => d.querySelector(".dir-name")?.textContent);
@@ -195,22 +224,35 @@ const t1 = await evalJs(`(() => {
   const items = Array.from(document.querySelectorAll("button.tree-item"));
   const idea = items.find(b => b.title === "work/idea.md");
   const rootNote = items.find(b => b.title === "root.md");
-  const mdVisible = items.some(b => /\\.md$/.test(b.textContent.trim()));
+  const meeting = items.find(b => b.title === "work/meeting.md");
+  const mdVisible = items.some(b => /\\.md$/.test((b.querySelector(".row-title")?.textContent || "").trim()));
   return {
     dirNames,
     counts,
     hasIdea: !!idea,
-    ideaText: idea?.textContent.trim(),
+    ideaText: idea?.querySelector(".row-title")?.textContent.trim(),
     hasRoot: !!rootNote,
-    rootText: rootNote?.textContent.trim(),
+    rootText: rootNote?.querySelector(".row-title")?.textContent.trim(),
+    meetingPreview: meeting?.querySelector(".row-preview")?.textContent.trim(),
+    meetingPreviewColor: meeting ? getComputedStyle(meeting.querySelector(".row-preview")).color : "n/a",
+    meetingMeta: meeting?.querySelector(".row-meta")?.textContent.trim(),
+    mutedVar: getComputedStyle(document.documentElement).getPropertyValue("--muted").trim(),
+    ideaTitleBold: idea ? getComputedStyle(idea.querySelector(".row-title")).fontWeight : "n/a",
+    ideaTitleFg: idea ? getComputedStyle(idea.querySelector(".row-title")).color : "n/a",
+    rowFg: idea ? getComputedStyle(idea).color : "n/a",
     mdVisible,
   };
 })()`);
 check("folders listed", JSON.stringify(t1.dirNames) === JSON.stringify(["empty-folder", "home", "work"]), JSON.stringify(t1.dirNames));
 check("folder counts (empty/home/work = 0/1/2)", JSON.stringify(t1.counts) === JSON.stringify(["0", "1", "2"]), JSON.stringify(t1.counts));
 check("nested note rendered (work/idea.md)", t1.hasIdea);
-check(".md hidden from note label", t1.ideaText === "idea" && t1.rootText === "root", `idea='${t1.ideaText}' root='${t1.rootText}'`);
-check("no '.md' visible anywhere", !t1.mdVisible);
+check(".md hidden from note title", t1.ideaText === "idea" && t1.rootText === "root", `idea='${t1.ideaText}' root='${t1.rootText}'`);
+check("no '.md' visible in any row title", !t1.mdVisible);
+check("rich row: preview line from the note body", t1.meetingPreview === "Weekly sync notes", `preview='${t1.meetingPreview}'`);
+check("rich row: device · time meta line", /^local · /.test(t1.meetingMeta || ""), `meta='${t1.meetingMeta}'`);
+check("rich row: title bold, preview in muted color",
+  Number(t1.ideaTitleBold) >= 600 && t1.ideaTitleFg === t1.rowFg && t1.meetingPreviewColor !== "n/a" && t1.meetingPreviewColor !== t1.rowFg,
+  `bold=${t1.ideaTitleBold} previewColor=${t1.meetingPreviewColor} fg=${t1.rowFg}`);
 
 // ---- 2. HTML5 drag&drop: work/idea.md -> home ----
 const dnd = await evalJs(`(() => {

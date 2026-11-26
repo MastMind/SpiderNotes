@@ -108,11 +108,37 @@ mod tests {
                 hlc: Hlc::from_parts(5, 1, "dev".into()),
                 hash: "abc".into(),
                 deleted: false,
+                title: "T".into(),
+                preview: "P".into(),
             },
         );
         idx.save(&t.0).unwrap();
         let loaded = Index::load(&t.0).unwrap();
         assert_eq!(loaded.notes.len(), 1);
         assert_eq!(loaded.device.as_ref().unwrap().name, "laptop");
+        let s = &loaded.notes[&u];
+        assert_eq!((s.title.as_str(), s.preview.as_str()), ("T", "P"));
+    }
+
+    #[test]
+    fn legacy_index_without_title_fields_loads() {
+        let t = TestDir::new();
+        let u = Uuid::new_v4();
+        std::fs::create_dir_all(t.0.join(crate::index::Index::DIR)).unwrap();
+        // an index.json written by an older version (no title/preview keys)
+        let raw = format!(
+            r#"{{"version":1,"device":null,"notes":{{"{u}":{{"uuid":"{u}","path":"x.md","hlc":{{"ms":1,"counter":0,"device":"d"}},"hash":"h","deleted":false}}}},"device_clock":null}}"#
+        );
+        std::fs::write(
+            t.0.join(crate::index::Index::DIR).join("index.json"),
+            raw,
+        )
+        .unwrap();
+        let idx = Index::load(&t.0).unwrap();
+        let s = &idx.notes[&u];
+        assert_eq!(
+            (s.title.as_str(), s.preview.as_str()),
+            ("", "")
+        );
     }
 }

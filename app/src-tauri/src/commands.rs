@@ -41,6 +41,8 @@ pub struct P2pSettings {
     /// Desired port, applied on (re)start of P2P.
     pub p2p_port_setting: u16,
     pub p2p_running: bool,
+    /// Unix seconds of the last successful sync, `None` when never.
+    pub last_sync: Option<u64>,
 }
 
 /// Relay-server state for the UI. The secret is intentionally never
@@ -205,6 +207,9 @@ async fn sync_vault_with_peers(
         }
     }
     if !out.is_empty() {
+        // something actually moved: record it for the UI's "last synced"
+        // line (an empty report = no reachable trusted peer, not a sync)
+        st.last_sync.store(now_secs(), Ordering::SeqCst);
         let _ = app.emit("notes-changed", ());
     }
     out
@@ -340,6 +345,7 @@ fn start_p2p(
     let gate_r = st.sync_gate.clone();
     let app_r = app.clone();
     let trust_r = st.trust.clone();
+    let last_r = st.last_sync.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(stream) = conn_rx.recv().await {
             // try_lock, never await: if our own initiator holds the gate, the
@@ -371,6 +377,9 @@ fn start_p2p(
                         report.skipped
                     );
                     *vaults_r.lock().unwrap() = Some(vault);
+                    // an incoming sync is a sync too: refresh the footer's
+                    // "last synced" moment
+                    last_r.store(now_secs(), Ordering::SeqCst);
                     let _ = app_r.emit("notes-changed", ());
                 }
                 Err(e) => tracing::warn!("P2P sync failed: {e}"),
@@ -708,6 +717,51 @@ pub async fn rescan(app: AppHandle) -> Result<Vec<NoteSummary>, String> {
     Ok(notes)
 }
 
+// ---- sync conflicts (three-way merge leftovers) ----
+
+/// Pending conflicts: peer versions that could not be auto-merged. Each one
+/// keeps the peer's version so nothing is silently lost.
+#[tauri::command]
+pub fn list_conflicts(app: AppHandle) -> Result<Vec<spidernotes_core::Conflict>, String> {
+    let st = (*app.state::<AppState>()).clone();
+    Ok(vault_or_err(&st)?.conflicts())
+}
+
+/// The peer's version stored with a conflict (for the resolution panel).
+#[tauri::command]
+pub fn conflict_content(app: AppHandle, id: String) -> Result<String, String> {
+    let st = (*app.state::<AppState>()).clone();
+    vault_or_err(&st)?.conflict_content(&id).map_err(|e| e.to_string())
+}
+
+/// Resolve a conflict. `keepTheirs = false` keeps our version (the peer's is
+/// discarded and suppressed, so it does not come back on the next sync);
+/// `keepTheirs = true` adopts the peer's version as a local edit — a fresh
+/// HLC that beats the peer's, pushed to the peers like any save.
+#[tauri::command]
+pub async fn resolve_conflict(
+    app: AppHandle,
+    id: String,
+    keep_theirs: bool,
+) -> Result<(), String> {
+    let st = (*app.state::<AppState>()).clone();
+    let _gate = st.sync_gate.lock().await;
+    let mut v = vault_or_err(&st)?;
+    if keep_theirs {
+        v.resolve_conflict_keep_theirs(&id).map_err(|e| e.to_string())?;
+    } else {
+        v.resolve_conflict_keep_ours(&id).map_err(|e| e.to_string())?;
+    }
+    st.put_vault(v);
+    // the note (or the conflict list) changed for the UI
+    let _ = app.emit("notes-changed", ());
+    // "keep theirs" is a local edit: push it to the peers
+    if keep_theirs {
+        schedule_push(app, st.clone());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn backlinks(app: AppHandle, uuid: String) -> Result<Vec<Backlink>, String> {
     let st = (*app.state::<AppState>()).clone();
@@ -791,11 +845,13 @@ pub fn device_info(app: AppHandle) -> Result<DeviceInfo, String> {
 #[tauri::command]
 pub fn p2p_settings(app: AppHandle) -> Result<P2pSettings, String> {
     let st = (*app.state::<AppState>()).clone();
+    let last = st.last_sync.load(Ordering::SeqCst);
     Ok(P2pSettings {
         autosync_secs: st.autosync_secs.load(Ordering::SeqCst),
         p2p_port: st.p2p_port.load(Ordering::SeqCst),
         p2p_port_setting: st.p2p_port_setting.load(Ordering::SeqCst),
         p2p_running: st.p2p_running.load(Ordering::SeqCst),
+        last_sync: (last != 0).then_some(last),
     })
 }
 
@@ -994,6 +1050,7 @@ pub async fn sync_with(app: AppHandle, peer: PeerInfo) -> Result<P2pSyncReport, 
         match res {
             Ok(r) => {
                 st.put_vault(v);
+                st.last_sync.store(now_secs(), Ordering::SeqCst);
                 let _ = app.emit("notes-changed", ());
                 return Ok(r);
             }
@@ -1019,12 +1076,31 @@ pub async fn sync_with(app: AppHandle, peer: PeerInfo) -> Result<P2pSyncReport, 
     }
 }
 
+/// Current unix time in seconds (0 if the clock is before the epoch).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[tauri::command]
 pub async fn sync_all(app: AppHandle) -> Result<Vec<P2pSyncReport>, String> {
     let st = (*app.state::<AppState>()).clone();
     let peers = st.merged_peers();
     let out = sync_vault_with_peers(&st, &app, &st.vault, &peers).await;
     Ok(out)
+}
+
+/// Destroy the main window. The frontend calls this after flushing pending
+/// edits in response to the "sn-before-close" event (emitted from the
+/// CloseRequested handler in lib.rs, which also force-destroys the window
+/// after a timeout as the safety net if the frontend never confirms).
+#[tauri::command]
+pub fn force_close(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.destroy();
+    }
 }
 
 

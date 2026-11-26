@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { NoteSummary } from "./types";
+import { WarnIcon } from "./icons";
 
 interface TreeNode {
   name: string;
@@ -20,6 +21,28 @@ const MOVE_SLOP_PX = 8;
 
 function stripMd(name: string): string {
   return name.replace(/\.md$/i, "");
+}
+
+// Compact "when" for list rows and the sync footer: today -> "12:34",
+// this year -> "26.11", older -> "26.11.24" (ru-RU, like the rest of the UI).
+export function formatWhen(ms: number): string {
+  const d = new Date(ms);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString())
+    return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  const opts: Intl.DateTimeFormatOptions =
+    d.getFullYear() === now.getFullYear()
+      ? { day: "2-digit", month: "2-digit" }
+      : { day: "2-digit", month: "2-digit", year: "2-digit" };
+  return d.toLocaleDateString("ru-RU", opts);
+}
+
+// "device · time" — the device is the HLC short id, resolved to a friendly
+// name via the map from App (own device + known peers); unknown ids show
+// as a short fragment.
+function rowMeta(n: NoteSummary, deviceNames: Map<string, string>): string {
+  const dev = deviceNames.get(n.hlc.device) ?? n.hlc.device.slice(0, 6);
+  return `${dev} · ${formatWhen(n.hlc.ms)}`;
 }
 
 /// Theme-aware folder glyph (SVG + currentColor — follows every color
@@ -119,11 +142,20 @@ export function NotesTree({
   onMoveNote,
   onDeleteNote,
   onMoveFolder,
+  deviceNames,
+  conflictCount,
+  onConflict,
 }: {
   notes: NoteSummary[];
   folders: string[];
   /** Full folder list for the "Move to…" picker (unfiltered by search). */
   allFolders: string[];
+  /** Device short id (HLC) -> friendly name, for the row meta line. */
+  deviceNames: Map<string, string>;
+  /** Note uuid -> number of pending sync conflicts (warning icon). */
+  conflictCount: Map<string, number>;
+  /** Open the conflict panel for a note. */
+  onConflict: (uuid: string) => void;
   selected: string | null;
   onSelect: (uuid: string) => void;
   onCreateFolder: (parentDir: string) => void;
@@ -368,7 +400,25 @@ export function NotesTree({
             onTouchMove={onTouchMoveCancel}
             onTouchEnd={onTouchEndCancel}
           >
-            {node.name}
+            <span className="row-top">
+              <span className="row-title">{n.title || node.name}</span>
+              {conflictCount.get(n.uuid) ? (
+                // a span, not a button: the row itself is a button (nested
+                // buttons are invalid) — stopPropagation keeps the row click
+                <span
+                  className="row-conflict"
+                  title="Sync conflict: open to choose a version"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onConflict(n.uuid);
+                  }}
+                >
+                  <WarnIcon />
+                </span>
+              ) : null}
+              <span className="row-meta">{rowMeta(n, deviceNames)}</span>
+            </span>
+            {n.preview ? <span className="row-preview">{n.preview}</span> : null}
           </button>
         </li>
       );

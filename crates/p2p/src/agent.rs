@@ -88,12 +88,26 @@ where
     };
 
     // stream my delta
-    let delta = my_delta(&my_summaries, &their_summaries);
+    // Both sides diverged from the shared base -> send even the OLDER copy,
+    // so the peer records the conflict (with content) instead of silently
+    // letting its own version win.
+    let diverged = vault.diverged_from_base(&their_summaries);
+    let delta = my_delta(&my_summaries, &their_summaries, &diverged);
     for s in &delta {
         let content = if s.deleted {
             None
         } else {
-            Some(vault.read(&s.uuid)?.content)
+            let c = vault.read(&s.uuid)?.content;
+            // Remember the sent version as the merge base only when the peer
+            // will actually adopt it. A forced send (both sides diverged)
+            // does not move the base: the peer keeps its own version, and
+            // the old base stays the correct common ancestor. Without the
+            // sender-side base, the device that created a note would keep no
+            // base and a first divergent edit could be silently lost to LWW.
+            if !diverged.iter().any(|f| *f == s.uuid) {
+                vault.set_base(&s.uuid, &c)?;
+            }
+            Some(c)
         };
         ss.send_frame(&Msg::Note { update: s.to_update(content) }.encode())
             .await?;
@@ -105,7 +119,7 @@ where
     loop {
         match Msg::decode(&ss.recv_frame().await?)? {
             Msg::Note { update } => {
-                if vault.apply_update(&update)? {
+                if vault.apply_update(&update, &report.peer_name)? {
                     report.applied += 1;
                 } else {
                     report.skipped += 1;
@@ -166,13 +180,19 @@ where
     )
     .await?;
 
-    // stream my delta
-    let delta = my_delta(&my_summaries, &their_summaries);
+    // stream my delta (same rules as in sync_initiator: LWW winners plus
+    // diverged versions, so conflicts are recorded on both sides)
+    let diverged = vault.diverged_from_base(&their_summaries);
+    let delta = my_delta(&my_summaries, &their_summaries, &diverged);
     for s in &delta {
         let content = if s.deleted {
             None
         } else {
-            Some(vault.read(&s.uuid)?.content)
+            let c = vault.read(&s.uuid)?.content;
+            if !diverged.iter().any(|f| *f == s.uuid) {
+                vault.set_base(&s.uuid, &c)?;
+            }
+            Some(c)
         };
         ss.send_frame(&Msg::Note { update: s.to_update(content) }.encode())
             .await?;
@@ -183,7 +203,7 @@ where
     loop {
         match Msg::decode(&ss.recv_frame().await?)? {
             Msg::Note { update } => {
-                if vault.apply_update(&update)? {
+                if vault.apply_update(&update, &report.peer_name)? {
                     report.applied += 1;
                 } else {
                     report.skipped += 1;
@@ -348,7 +368,9 @@ mod tests {
     async fn two_vaults_converge() {
         // Round 1: A has shared.md + only-a.md; B has only-b.md
         let (env_a, mut vault_a) = Env::new("a");
-        let shared = vault_a.write("shared.md", "hello v1").unwrap();
+        let shared = vault_a
+            .write("shared.md", "base one\nbase two\nbase three")
+            .unwrap();
         vault_a.write("only-a.md", "A only").unwrap();
         let (env_b, mut vault_b) = Env::new("b");
         vault_b.write("only-b.md", "B only").unwrap();
@@ -364,24 +386,70 @@ mod tests {
             .unwrap();
         assert_eq!(shared_on_b.uuid, shared.uuid);
 
-        // Round 2: both edit shared.md; B edits later -> B wins LWW
-        vault_a.write("shared.md", "A version").unwrap();
+        // Round 2: both edit DISJOINT lines of shared.md -> three-way merge
+        // combines them on both sides (no LWW loss, no conflict). One
+        // exchange is not enough to converge: the merge result must travel
+        // back, so a second exchange follows.
+        vault_a.write("shared.md", "base one\nA two\nbase three").unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let winner = vault_b.write("shared.md", "B version (winner)").unwrap();
+        vault_b.write("shared.md", "base one\nbase two\nB three").unwrap();
+
+        let (_ra2, _rb2, mut vault_b) = sync_once(&mut vault_a, &mut vault_b).await;
+        for v in [&vault_a, &vault_b] {
+            assert!(v.conflicts().is_empty(), "disjoint edits must not conflict");
+        }
+        let (_ra3, _rb3, _vault_b) = sync_once(&mut vault_a, &mut vault_b).await;
+        let content_b = std::fs::read_to_string(env_b.dir.join("shared.md")).unwrap();
+        assert!(
+            content_b.contains("A two") && content_b.contains("B three"),
+            "both edits must survive the merge: {content_b}"
+        );
+        let content_a = std::fs::read_to_string(env_a.dir.join("shared.md")).unwrap();
+        assert!(
+            content_a.contains("A two") && content_a.contains("B three"),
+            "both edits must survive the merge: {content_a}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_edits_conflict_without_silent_loss() {
+        // Both sides rewrite the same (single-line) note: a genuine
+        // overlap. Neither version may be dropped — each side keeps its own
+        // live and records the peer's version as a conflict.
+        let (env_a, mut vault_a) = Env::new("ov-a");
+        let shared = vault_a.write("shared.md", "old line").unwrap();
+        let (env_b, mut vault_b) = Env::new("ov-b");
+
+        let (_ra, _rb, mut vault_b) = sync_once(&mut vault_a, &mut vault_b).await;
+        assert_eq!(
+            vault_b.get(&shared.uuid).map(|s| s.path.clone()),
+            Some("shared.md".to_string())
+        );
+
+        vault_a.write("shared.md", "A's rewrite").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        vault_b.write("shared.md", "B's rewrite").unwrap();
 
         let (_ra2, _rb2, vault_b) = sync_once(&mut vault_a, &mut vault_b).await;
-        for v in [&vault_a, &vault_b] {
-            let s = v
-                .live_notes()
-                .into_iter()
-                .find(|s| s.path == "shared.md")
-                .unwrap();
-            assert_eq!(s.uuid, winner.uuid, "LWW: B's later edit must win");
-        }
-        let content_b = std::fs::read_to_string(env_b.dir.join("shared.md")).unwrap();
-        assert!(content_b.contains("B version (winner)"));
+        // each side keeps its own version live ...
         let content_a = std::fs::read_to_string(env_a.dir.join("shared.md")).unwrap();
-        assert!(content_a.contains("B version (winner)"));
+        assert!(content_a.contains("A's rewrite"));
+        let content_b = std::fs::read_to_string(env_b.dir.join("shared.md")).unwrap();
+        assert!(content_b.contains("B's rewrite"));
+        // ... and records the peer's version (named after the peer)
+        for (v, peer, other) in [
+            (&vault_a, "ov-b", "B's rewrite"),
+            (&vault_b, "ov-a", "A's rewrite"),
+        ] {
+            let cs = v.conflicts();
+            assert_eq!(cs.len(), 1, "one pending conflict per side");
+            assert_eq!(cs[0].peer_name, peer);
+            assert!(
+                v.conflict_content(&cs[0].id).unwrap().contains(other),
+                "peer's version must be recoverable"
+            );
+        }
+        let _ = env_b;
     }
 
     #[tokio::test]
@@ -392,7 +460,7 @@ mod tests {
         let (env_b, mut vault_b) = Env::new("del-b");
         // B already has the note (same uuid/hlc as A had)
         let _ = vault_b
-            .apply_update(&s.to_update(Some("bye".into())));
+            .apply_update(&s.to_update(Some("bye".into())), "a");
 
         vault_a.delete(&s.uuid).unwrap();
 

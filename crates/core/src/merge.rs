@@ -46,6 +46,8 @@ mod tests {
             hlc: Hlc::from_parts(ms, 0, device.into()),
             hash: "h".into(),
             deleted,
+            title: String::new(),
+            preview: String::new(),
         }
     }
 

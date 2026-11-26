@@ -4,7 +4,7 @@
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use spidernotes_core::{Hlc, NoteSummary, NoteUpdate};
+use spidernotes_core::{Hlc, NoteSummary, NoteUpdate, Uuid};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", content = "c")]
@@ -41,13 +41,21 @@ impl Msg {
     }
 }
 
-/// Notes I have that the peer should pull: unknown to peer, or newer than peer's copy.
-pub fn my_delta(mine: &[NoteSummary], theirs: &[NoteSummary]) -> Vec<NoteSummary> {
+/// Notes I have that the peer should pull: unknown to the peer, newer than
+/// the peer's copy, or in `forced` — notes where BOTH sides diverged from
+/// the last shared version. The forced ones may be OLDER than the peer's
+/// copy: they must still be sent, so the peer can record the conflict (with
+/// the version's content) instead of silently letting its own version win.
+pub fn my_delta(
+    mine: &[NoteSummary],
+    theirs: &[NoteSummary],
+    forced: &[Uuid],
+) -> Vec<NoteSummary> {
     mine.iter()
         .filter(|m| {
             match theirs.iter().find(|t| t.uuid == m.uuid) {
                 None => true,
-                Some(t) => m.hlc > t.hlc,
+                Some(t) => m.hlc > t.hlc || forced.iter().any(|f| *f == m.uuid),
             }
         })
         .cloned()
@@ -67,6 +75,8 @@ mod tests {
             hlc: Hlc::from_parts(ms, 0, dev.into()),
             hash: "h".into(),
             deleted,
+            title: String::new(),
+            preview: String::new(),
         }
     }
 
@@ -92,6 +102,8 @@ mod tests {
                 hlc: Hlc::from_parts(100, 0, "me".into()),
                 hash: "h".into(),
                 deleted: false,
+                title: String::new(),
+                preview: String::new(),
             },
             NoteSummary {
                 uuid: u2,
@@ -99,6 +111,8 @@ mod tests {
                 hlc: Hlc::from_parts(50, 0, "me".into()),
                 hash: "h".into(),
                 deleted: false,
+                title: String::new(),
+                preview: String::new(),
             },
         ];
         let theirs = vec![NoteSummary {
@@ -107,8 +121,10 @@ mod tests {
             hlc: Hlc::from_parts(99, 0, "peer".into()),
             hash: "h".into(),
             deleted: false,
+            title: String::new(),
+            preview: String::new(),
         }];
-        let d = my_delta(&mine, &theirs);
+        let d = my_delta(&mine, &theirs, &[]);
         let uuids: Vec<Uuid> = d.iter().map(|s| s.uuid).collect();
         assert_eq!(uuids, vec![u1, u2]);
     }
@@ -118,6 +134,34 @@ mod tests {
         let s1 = sum(100, "peer", false);
         let mine = vec![s1.clone()];
         let theirs = vec![s1];
-        assert!(my_delta(&mine, &theirs).is_empty());
+        assert!(my_delta(&mine, &theirs, &[]).is_empty());
+    }
+
+    #[test]
+    fn delta_forces_diverged_older_note() {
+        // the peer's copy is NEWER, but both sides diverged from the shared
+        // base: the older note must still be sent (conflict detection)
+        let u = Uuid::new_v4();
+        let mine = vec![NoteSummary {
+            uuid: u,
+            path: "a.md".into(),
+            hlc: Hlc::from_parts(50, 0, "me".into()),
+            hash: "mine".into(),
+            deleted: false,
+            title: String::new(),
+            preview: String::new(),
+        }];
+        let theirs = vec![NoteSummary {
+            uuid: u,
+            path: "a.md".into(),
+            hlc: Hlc::from_parts(60, 0, "peer".into()),
+            hash: "theirs".into(),
+            deleted: false,
+            title: String::new(),
+            preview: String::new(),
+        }];
+        assert!(my_delta(&mine, &theirs, &[]).is_empty());
+        let d = my_delta(&mine, &theirs, &[u]);
+        assert_eq!(d.iter().map(|s| s.uuid).collect::<Vec<_>>(), vec![u]);
     }
 }

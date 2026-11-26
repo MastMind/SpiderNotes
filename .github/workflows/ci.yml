@@ -119,16 +119,36 @@ jobs:
             sudo bash -c 'printf "Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble noble-updates noble-backports noble-security\nComponents: main universe\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n" > /etc/apt/sources.list.d/ports-arm64.sources'
             sudo rm -f /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources
             sudo dpkg --add-architecture arm64
-            sudo apt-get update || sudo apt-get update
             # native python3 + qemu satisfy libglib2.0-dev:arm64's
             # "python3 | qemu-user | qemu-user-static" and "python3:any" deps;
             # otherwise apt pulls an arm64 python whose postinst cannot run
             # on x86 (Exec format error)
-            sudo apt-get install -y --no-install-recommends \
-              build-essential curl wget file pkg-config python3 qemu-user-static \
-              gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross \
-              libwebkit2gtk-4.1-dev:arm64 libxdo-dev:arm64 libssl-dev:arm64 \
-              libayatana-appindicator3-dev:arm64 librsvg2-dev:arm64
+            # USN rollouts republish the ports archive in bursts: there is a
+            # short skew window where a -dev package at version N+1 is visible
+            # but its runtime twin (strict `=` pin) is not yet, so apt fails
+            # with "Unable to correct problems". Retry with a fresh index
+            # fetch before giving up.
+            ok=""
+            for attempt in 1 2 3; do
+              sudo apt-get update || sudo apt-get update
+              if sudo apt-get install -y --no-install-recommends \
+                build-essential curl wget file pkg-config python3 qemu-user-static \
+                gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross \
+                libwebkit2gtk-4.1-dev:arm64 libxdo-dev:arm64 libssl-dev:arm64 \
+                libayatana-appindicator3-dev:arm64 librsvg2-dev:arm64; then
+                ok=1
+                break
+              fi
+              echo "::warning::arm64 dependency resolution failed (attempt $attempt); re-fetching indexes"
+              sleep 30
+              sudo rm -rf /var/lib/apt/lists
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::arm64 dependencies unresolvable after 3 attempts"
+              apt-cache policy libtiff6:arm64 libtiff-dev:arm64 2>/dev/null | head -20
+              apt-cache policy libglib2.0-dev:arm64 2>/dev/null | head -5
+              exit 1
+            fi
             # fail loudly with diagnostics if the cross stack is missing
             if [ ! -f /usr/lib/aarch64-linux-gnu/pkgconfig/glib-2.0.pc ]; then
               echo "::error::arm64 webkit/glib dev stack missing"

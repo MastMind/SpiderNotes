@@ -49,6 +49,31 @@ const realNotes = {
   "plain.md": "просто текст без frontmatter\n",
   "empty.md": "",
 };
+// JS port of crates/core title_preview() (see check-tree-browser.mjs)
+function titlePreview(content) {
+  let body = content.split("\n");
+  if (content.startsWith("---")) {
+    const end = body.findIndex((l, i) => i > 0 && l.trim() === "---");
+    if (end >= 0) body = body.slice(end + 1);
+  }
+  let ti = -1;
+  for (let i = 0; i < body.length; i++) {
+    if (/^\s*#{1,6}(?:$|[\s\t])/.test(body[i])) { ti = i; break; }
+  }
+  if (ti < 0) ti = body.findIndex((l) => l.trim() !== "");
+  if (ti < 0) return { title: "", preview: "" };
+  let title = body[ti].trimStart().replace(/^#+[\s\t]?/, "").replace(/#+\s*$/, "").trim();
+  let preview = "";
+  for (let i = ti + 1; i < body.length; i++) {
+    if (body[i].trim()) {
+      preview = body[i].trim().split(/\s+/).join(" ");
+      const chars = [...preview];
+      if (chars.length > 80) preview = chars.slice(0, 80).join("") + "…";
+      break;
+    }
+  }
+  return { title, preview };
+}
 const notes = Object.entries(realNotes).map(([p, content], i) => {
   const uuid = (
     content.match(/spidernotes-id:\s*(\S+)/)?.[1] ??
@@ -61,6 +86,7 @@ const notes = Object.entries(realNotes).map(([p, content], i) => {
     hash: "",
     deleted: false,
     content,
+    ...titlePreview(content),
   };
 });
 const notesList = notes.map(({ content, ...s }) => s);
@@ -103,7 +129,8 @@ window.__TAURI_INTERNALS__ = {
       case "untrust_device": return [];
       case "sync_with": return { peer_name: "?", sent: 0, applied: 0, skipped: 0 };
       case "sync_all": return [];
-      case "p2p_settings": return { autosync_secs: 30, p2p_port: 8788, p2p_port_setting: 8788, p2p_running: true };
+      case "p2p_settings": return { autosync_secs: 30, p2p_port: 8788, p2p_port_setting: 8788, p2p_running: true, last_sync: null };
+      case "server_sync_status": return { enabled: false, connected: false, status: "server sync is off" };
       case "set_bg_sync": return null;
       case "set_autosync_secs": return args.secs;
       case "set_p2p_port_setting": return args.port;

@@ -57,6 +57,9 @@ pub struct AppState {
     pub push_pending: Arc<AtomicBool>,
     /// Monotonic count of local note changes (used to coalesce push-on-change).
     pub change_seq: Arc<AtomicU64>,
+  /// Unix seconds of the last successful sync (0 = never), for the UI's
+  /// "last synced at" line.
+  pub last_sync: Arc<AtomicU64>,
   /// Stop handle for the running P2P loops (accept / discovery / ticker).
   pub p2p_stop: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
   /// On-demand mDNS daemon refresh (counter). The discovery loop recreates
@@ -91,6 +94,7 @@ impl AppState {
             p2p_port_setting: Arc::new(AtomicU16::new(DEFAULT_P2P_PORT)),
             push_pending: Arc::new(AtomicBool::new(false)),
             change_seq: Arc::new(AtomicU64::new(0)),
+            last_sync: Arc::new(AtomicU64::new(0)),
             p2p_stop: Arc::new(Mutex::new(None)),
             mdns_refresh_tx,
             server_cfg: Arc::new(Mutex::new(None)),
