@@ -5,12 +5,379 @@ import {
   Text,
   type Extension,
 } from "@codemirror/state";
-import { Decoration, DecorationSet, EditorView } from "@codemirror/view";
+import {
+  Decoration,
+  DecorationSet,
+  EditorView,
+  WidgetType,
+} from "@codemirror/view";
+import { convertFileSrc } from "@tauri-apps/api/core";
+
+// The vault's absolute root: local image/media sources in the markdown are
+// resolved against it (set by App on vault open).
+let vaultRoot = "";
+export function setVaultRoot(p: string) {
+  vaultRoot = p;
+}
+
+// The vault's local media server (127.0.0.1, set by App on vault open).
+// WebKit's media pipeline plays large <video>/<audio> from plain HTTP, but
+// not from the asset: scheme (its Range probe fails) nor from a large
+// blob: URL (stalls in NETWORK_LOADING) — see media_server.rs.
+let mediaPort = 0;
+export function setMediaPort(p: number) {
+  mediaPort = p;
+}
+
+// A local markdown src made absolute against the vault root (http(s)/
+// data:/blob: pass through unchanged). Local srcs are percent-decoded —
+// media imports encode spaces as %20 (a raw space would break the
+// markdown src token).
+function absPath(src: string): string {
+  const s = src.trim();
+  if (/^(https?:|data:|blob:)/i.test(s)) return s;
+  let local = s;
+  try {
+    local = decodeURIComponent(s);
+  } catch {
+    // a malformed % sequence — use it raw
+  }
+  if (vaultRoot && !local.startsWith("/") && !/^[a-zA-Z]:/.test(local)) {
+    return (
+      vaultRoot.replace(/\\/g, "/").replace(/\/+$/, "") +
+      "/" +
+      local.replace(/^\.\/+/, "")
+    );
+  }
+  return local;
+}
+
+// Resolve a markdown src for <img>/<video>/<audio>/<embed>: http(s)/data/
+// blob pass through; a local path is made absolute against the vault root
+// and served by the Tauri asset protocol (browser: left relative, it just
+// won't load).
+function resolveSrc(raw: string): string {
+  const src = raw.trim();
+  if (/^(https?:|data:|blob:)/i.test(src)) return src;
+  const abs = absPath(src);
+  if ((window as any).__TAURI_INTERNALS__) {
+    try {
+      return convertFileSrc(abs);
+    } catch {
+      // fall through to the raw path
+    }
+  }
+  return src;
+}
+
+// A vault-relative markdown src as a loopback media-server URL. The server
+// roots at the vault's hidden .assets dir, so `!.assets/foo.mp4` maps to
+// /foo.mp4. null when the server is not running (plain browser) or the src
+// is not a vault-relative media path.
+function mediaHttpUrl(raw: string): string | null {
+  if (!mediaPort) return null;
+  const s = raw.trim();
+  if (/^(https?:|data:|blob:)/i.test(s)) return null;
+  let local = s;
+  try {
+    local = decodeURIComponent(s);
+  } catch {
+    // a malformed % sequence — use it raw
+  }
+  const rel = local.replace(/^\.\/+/, "");
+  const path = rel.startsWith(".assets/") ? rel.slice(".assets/".length) : rel;
+  if (!path) return null;
+  return (
+    `http://127.0.0.1:${mediaPort}/` +
+    path.split("/").map(encodeURIComponent).join("/")
+  );
+}
+
+// WebKit (macOS / Linux desktop) renders PDFs natively inside <embed>;
+// Windows WebView2 and Android/iOS WebViews would show a blank page, so
+// there a card opens the file in the system viewer instead.
+function canInlinePdf(): boolean {
+  const ua = navigator.userAgent;
+  return /AppleWebKit|WebKit/i.test(ua) && !/(Android|iPhone|iPad|Windows)/i.test(ua);
+}
+
+// Open a LOCAL file in the system default app (opener plugin in the app,
+// a new tab in a browser).
+function openLocalFile(abs: string) {
+  const w = window as any;
+  if (/^https?:/i.test(abs)) {
+    openExternal(abs);
+    return;
+  }
+  if (w.__TAURI_INTERNALS__) {
+    w.__TAURI_INTERNALS__
+      .invoke("plugin:opener|open_path", { path: abs })
+      .catch(() => {});
+    return;
+  }
+  window.open(abs, "_blank");
+}
+
+// --- clickable widgets for the preview ---
+
+// A task-list checkbox: replaces the literal `[ ]` / `[x]`; a click flips
+// the three characters in the doc (the position is re-derived from the DOM
+// on click, so mapped decorations stay correct).
+class BoxWidget extends WidgetType {
+  constructor(readonly checked: boolean) {
+    super();
+  }
+  eq(o: BoxWidget) {
+    return o.checked === this.checked;
+  }
+  toDOM(view: EditorView): HTMLElement {
+    const el = document.createElement("span");
+    el.className = "md-checkbox" + (this.checked ? " checked" : "");
+    el.contentEditable = "false";
+    el.addEventListener("click", () => {
+      // the position is derived from the DOM at click time, so mapped
+      // (stale-range) decorations stay correct
+      const pos = view.posAtDOM(el);
+      view.dispatch({
+        changes: {
+          from: pos,
+          to: pos + 3,
+          insert: this.checked ? "[ ]" : "[x]",
+        },
+        userEvent: "input.update",
+      });
+    });
+    return el;
+  }
+}
+
+// An inline image: replaces the whole `![alt](src)`; a load failure swaps
+// the <img> for a dashed placeholder with the alt text.
+class ImgWidget extends WidgetType {
+  constructor(readonly src: string, readonly alt: string) {
+    super();
+  }
+  eq(o: ImgWidget) {
+    return o.src === this.src && o.alt === this.alt;
+  }
+  toDOM(): HTMLElement {
+    const wrap = document.createElement("span");
+    wrap.className = "md-img-wrap";
+    wrap.contentEditable = "false";
+    const img = document.createElement("img");
+    img.className = "md-img";
+    img.alt = this.alt;
+    img.src = this.src;
+    img.addEventListener("error", () => {
+      img.remove();
+      wrap.classList.add("md-img-broken");
+      wrap.textContent = this.alt || "image";
+    });
+    wrap.appendChild(img);
+    return wrap;
+  }
+}
+
+// The WebKit media pipeline (AVFoundation on macOS/iOS, GStreamer on
+// Linux) loads <video>/<audio> OUTSIDE the web process and never consults
+// the custom asset: URL handler — the element errors while the very same
+// URL works in <img> and fetch. So for asset: sources we fetch in the web
+// process and hand the element a blob: URL. A Map deduplicates per source
+// (one blob per file, shared by every widget that references it) and a
+// refcount revokes the blob when the last widget using it is gone.
+const blobUrls = new Map<string, string>();
+const blobPromises = new Map<string, Promise<string>>();
+const blobRefs = new Map<string, number>();
+
+function isAssetSrc(src: string): boolean {
+  return /^asset:\/\//i.test(src) || /^https?:\/\/asset\.localhost\//i.test(src);
+}
+
+function assetBlobUrl(src: string): Promise<string> {
+  let p = blobPromises.get(src);
+  if (!p) {
+    p = (async () => {
+      const res = await fetch(src);
+      if (!res.ok) throw new Error(`asset ${res.status}`);
+      const buf = await res.arrayBuffer();
+      const type = res.headers.get("content-type") || undefined;
+      const url = URL.createObjectURL(new Blob([buf], { type }));
+      blobUrls.set(src, url);
+      return url;
+    })();
+    p.catch(() => {
+      blobPromises.delete(src); // allow a retry from a later widget
+    });
+    blobPromises.set(src, p);
+  }
+  return p;
+}
+
+function releaseAssetBlob(src: string) {
+  const n = (blobRefs.get(src) ?? 0) - 1;
+  if (n > 0) {
+    blobRefs.set(src, n);
+    return;
+  }
+  blobRefs.delete(src);
+  // revoke only once the blob exists (a still-pending fetch keeps its
+  // entry around and is released by a later decrement)
+  const url = blobUrls.get(src);
+  if (url) {
+    URL.revokeObjectURL(url);
+    blobUrls.delete(src);
+    blobPromises.delete(src);
+  }
+}
+
+// An inline audio/video element for media files referenced as images
+// (`![demo](demo.mp4)`). `src` is the loopback media-server URL when one is
+// running (WebKit plays large files from HTTP); `fallback` is the asset:
+// URL used when the server 404s (media that is not under .assets/).
+class MediaWidget extends WidgetType {
+  private refHeld = false;
+  constructor(
+    readonly kind: "video" | "audio",
+    readonly src: string,
+    readonly fallback: string | null = null,
+  ) {
+    super();
+  }
+  eq(o: MediaWidget) {
+    return o.kind === this.kind && o.src === this.src;
+  }
+  // The player controls are interactive: without this CodeMirror treats a
+  // click/drag on the seek bar or volume button as editor input (stealing
+  // the selection and killing playback), so the controls appear dead.
+  ignoreEvent(): boolean {
+    return true;
+  }
+  // the view calls this when the widget's DOM is removed
+  destroy(_dom: HTMLElement): void {
+    void _dom;
+    if (this.refHeld) {
+      this.refHeld = false;
+      releaseAssetBlob(this.src);
+    }
+  }
+  private armAsset(el: HTMLMediaElement, src: string): void {
+    this.refHeld = true;
+    blobRefs.set(src, (blobRefs.get(src) ?? 0) + 1);
+    assetBlobUrl(src)
+      .then((blob) => {
+        // the widget was already removed: the blob is released elsewhere
+        if ((blobRefs.get(src) ?? 0) < 1) return;
+        el.src = blob;
+      })
+      .catch(() => {
+        // fetch failed (offline etc.) — the direct src stays
+      });
+  }
+  toDOM(): HTMLElement {
+    const wrap = document.createElement("span");
+    wrap.className = "md-media-wrap";
+    wrap.contentEditable = "false";
+    const el = document.createElement(this.kind);
+    el.className = this.kind === "video" ? "md-video" : "md-audio";
+    el.controls = true;
+    if (this.kind === "video") {
+      el.preload = "metadata";
+      (el as HTMLVideoElement).playsInline = true;
+    }
+    el.src = this.src;
+    if (isAssetSrc(this.src)) {
+      this.armAsset(el, this.src);
+    } else if (this.fallback) {
+      // the loopback 404s when the file is not under .assets/ (media
+      // imported before the hidden dir) — fall back to the asset: URL
+      const fb = this.fallback;
+      el.addEventListener(
+        "error",
+        () => {
+          el.src = fb;
+          this.armAsset(el, fb);
+        },
+        { once: true },
+      );
+    }
+    wrap.appendChild(el);
+    return wrap;
+  }
+}
+
+// A PDF referenced as `![doc](doc.pdf)`: on WebKit (macOS / Linux desktop)
+// the first page (and the whole document) renders inline via <embed>;
+// elsewhere a card opens the file in the system viewer on click.
+class PdfWidget extends WidgetType {
+  constructor(readonly src: string, readonly name: string, readonly abs: string) {
+    super();
+  }
+  eq(o: PdfWidget) {
+    return o.src === this.src;
+  }
+  toDOM(): HTMLElement {
+    const wrap = document.createElement("span");
+    wrap.className = "md-pdf-wrap";
+    wrap.contentEditable = "false";
+    if (canInlinePdf()) {
+      const el = document.createElement("embed");
+      el.className = "md-pdf";
+      el.type = "application/pdf";
+      el.src = this.src;
+      wrap.appendChild(el);
+    } else {
+      const card = document.createElement("span");
+      card.className = "md-pdf-card";
+      card.title = this.abs;
+      card.textContent = "PDF · " + this.name;
+      card.addEventListener("click", () => openLocalFile(this.abs));
+      wrap.appendChild(card);
+    }
+    return wrap;
+  }
+}
+
+// A clickable card for an http(s) link: the whole [text](url) syntax is
+// replaced by a preview chip (globe + host); a click opens the URL.
+class LinkCardWidget extends WidgetType {
+  constructor(readonly url: string) {
+    super();
+  }
+  eq(o: LinkCardWidget) {
+    return o.url === this.url;
+  }
+  toDOM(): HTMLElement {
+    let host = this.url;
+    try {
+      host = new URL(this.url).host;
+    } catch {
+      // keep the raw url
+    }
+    const wrap = document.createElement("span");
+    wrap.className = "md-link-card";
+    wrap.contentEditable = "false";
+    wrap.setAttribute("data-url", this.url);
+    wrap.title = this.url;
+    const ico = document.createElement("span");
+    ico.className = "md-link-ico";
+    ico.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9.5"/><path d="M2.5 12h19"/><path d="M12 2.5a14.5 14.5 0 0 1 3.8 9.5 14.5 14.5 0 0 1-3.8 9.5 14.5 14.5 0 0 1-3.8-9.5 14.5 14.5 0 0 1 3.8-9.5z"/></svg>';
+    const txt = document.createElement("span");
+    txt.className = "md-link-text";
+    txt.textContent = host;
+    wrap.appendChild(ico);
+    wrap.appendChild(txt);
+    wrap.addEventListener("click", () => openExternal(this.url));
+    return wrap;
+  }
+}
 
 // --- block-level (line) patterns ---
 const RE_HEADING = /^(#{1,6})(\s)/;
 const RE_HR = /^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/;
 const RE_QUOTE = /^(\s*>)/;
+// GFM task-list item: a bullet followed by `[ ]` or `[x]`
+const RE_TASK = /^(\s*)([-*+])(\s)(\[( |x|X)\])(\s)/;
 const RE_UL = /^(\s*)([-*+])(\s)/;
 const RE_OL = /^(\s*)(\d+)([.)])(\s)/;
 const RE_FENCE = /^\s*(```|~~~)/;
@@ -23,8 +390,21 @@ const RE_STRIKE = /~~([^~]+)~~/g;
 const RE_ITALIC =
   /\*([^*\s][^*]*)\*|(?<![\p{L}\p{N}])_([^_\s][^_]*)_(?![\p{L}\p{N}])/gu;
 const RE_WIKILINK = /\[\[([^\]]+)\]\]/g;
+// `![alt](src)` — scanned before RE_LINK so the overlap guard keeps the
+// link scanner away from it; media extensions become audio/video elements,
+// pdf a preview (inline on WebKit, a card elsewhere)
+const RE_IMAGE = /!\[([^\]]*)\]\(\s*([^)\s]+)(?:\s+["'][^)]*)?\)/g;
+const RE_AUDIO_EXT = /\.(mp3|wav|m4a|flac|aac|opus|ogg)$/i;
+const RE_VIDEO_EXT = /\.(mp4|webm|ogv|mov)$/i;
+const RE_PDF_EXT = /\.pdf$/i;
 const RE_LINK = /\[([^\]]+)\]\(([^)]+)\)/g;
 const RE_TAG = /(^|\s)(#[\p{L}\p{N}_-]+)/gu;
+
+// Special collectInline class prefixes carrying widget payloads
+const P_IMG = "@img:";
+const P_MEDIA = "@media:";
+const P_LINK = "@link:";
+const P_CARD = "@card:";
 
 type Range = [number, number, string];
 
@@ -103,13 +483,32 @@ function collectInline(line: string, lineFrom: number): Range[] {
       [end - 2, end, "md-hide"],
     ];
   });
-  // [text](url) — hide brackets and the URL, style the text
+  // ![alt](src) — replace the whole syntax with an image (or, for media
+  // extensions, an audio/video element; for pdf, a preview)
+  scan(RE_IMAGE, (m) => {
+    const src = m[2].trim();
+    const name = src.split("/").pop() || src;
+    const payload = RE_AUDIO_EXT.test(name)
+      ? P_MEDIA + "audio|" + encodeURIComponent(src)
+      : RE_VIDEO_EXT.test(name)
+        ? P_MEDIA + "video|" + encodeURIComponent(src)
+        : RE_PDF_EXT.test(name)
+          ? P_MEDIA + "pdf|" + encodeURIComponent(src)
+          : P_IMG + encodeURIComponent(src) + "|" + encodeURIComponent(m[1]);
+    return [[m.index, m.index + m[0].length, payload]];
+  });
+  // [text](url) — http(s) links become a preview card (whole syntax
+  // replaced); other links (mailto: …) keep the styled-text treatment
   scan(RE_LINK, (m) => {
+    const url = m[2].trim();
+    if (/^https?:\/\//i.test(url)) {
+      return [[m.index, m.index + m[0].length, P_CARD + encodeURIComponent(url)]];
+    }
     const textStart = m.index + 1;
     const textEnd = textStart + m[1].length;
     return [
       [m.index, textStart, "md-hide"],
-      [textStart, textEnd, "md-link"],
+      [textStart, textEnd, P_LINK + encodeURIComponent(url)],
       [textEnd, m.index + m[0].length, "md-hide"],
     ];
   });
@@ -228,6 +627,24 @@ export function computePreviewDecos(doc: Text): DecorationSet {
         addLine(Decoration.line({ class: "md-quote" }));
         // hide `> `
         addMark(from, from + m[0].length, "md-hide");
+      } else if ((m = RE_TASK.exec(text))) {
+        addLine(Decoration.line({ class: "md-li md-task" }));
+        // hide the bullet character (the checkbox is the visible marker)
+        addMark(
+          from + m[1].length,
+          from + m[1].length + m[2].length,
+          "md-hide",
+        );
+        // replace `[ ]` / `[x]` with a clickable checkbox widget
+        const boxStart = from + m[1].length + m[2].length + m[3].length;
+        // CM 6.43+: replace takes a spec object; a bare WidgetType is
+        // silently dropped (rendered as an empty span)
+        items.push({
+          from: boxStart,
+          to: boxStart + 3,
+          deco: Decoration.replace({ widget: new BoxWidget(m[4] !== "[ ]") }),
+          side: 1,
+        });
       } else if ((m = RE_UL.exec(text))) {
         addLine(Decoration.line({ class: "md-li md-li-ul" }));
         // hide the bullet character
@@ -252,7 +669,68 @@ export function computePreviewDecos(doc: Text): DecorationSet {
       }
 
       for (const [s, e, cls] of collectInline(text, from)) {
-        addMark(s, e, cls);
+        if (cls.startsWith(P_IMG)) {
+          const [src, alt] = cls.slice(P_IMG.length).split("|");
+          items.push({
+            from: s,
+            to: e,
+            deco: Decoration.replace({
+              widget: new ImgWidget(
+                resolveSrc(decodeURIComponent(src)),
+                decodeURIComponent(alt),
+              ),
+            }),
+            side: 1,
+          });
+        } else if (cls.startsWith(P_MEDIA)) {
+          const [kind, src] = cls.slice(P_MEDIA.length).split("|");
+          const raw = decodeURIComponent(src);
+          let name = raw.split("/").pop() || raw;
+          try {
+            name = decodeURIComponent(name);
+          } catch {
+            // keep as-is
+          }
+          const assetSrc = resolveSrc(raw);
+          const httpSrc = mediaHttpUrl(raw);
+          items.push({
+            from: s,
+            to: e,
+            deco: Decoration.replace({
+              widget:
+                kind === "pdf"
+                  ? new PdfWidget(assetSrc, name, absPath(raw))
+                  : new MediaWidget(
+                      kind === "video" ? "video" : "audio",
+                      httpSrc ?? assetSrc,
+                      httpSrc ? assetSrc : null,
+                    ),
+            }),
+            side: 1,
+          });
+        } else if (cls.startsWith(P_CARD)) {
+          items.push({
+            from: s,
+            to: e,
+            deco: Decoration.replace({
+              widget: new LinkCardWidget(decodeURIComponent(cls.slice(P_CARD.length))),
+            }),
+            side: 1,
+          });
+        } else if (cls.startsWith(P_LINK)) {
+          const url = decodeURIComponent(cls.slice(P_LINK.length));
+          items.push({
+            from: s,
+            to: e,
+            deco: Decoration.mark({
+              class: "md-link",
+              attributes: { "data-url": url },
+            }),
+            side: 2,
+          });
+        } else {
+          addMark(s, e, cls);
+        }
       }
     }
   }
@@ -295,6 +773,19 @@ export const previewField = StateField.define<DecorationSet>({
   },
 });
 
+// Open an external (http/https) link: the Tauri opener plugin in the
+// app, a new browser tab otherwise.
+function openExternal(url: string) {
+  const w = window as any;
+  if (w.__TAURI_INTERNALS__) {
+    w.__TAURI_INTERNALS__
+      .invoke("plugin:opener|open_url", { url })
+      .catch(() => window.open(url, "_blank", "noopener"));
+    return;
+  }
+  window.open(url, "_blank", "noopener");
+}
+
 export function livePreviewExtensions(): Extension[] {
   return [
     liveField,
@@ -308,5 +799,20 @@ export function livePreviewExtensions(): Extension[] {
     // not be specified via plugins` on construction -> the whole app
     // unmounts (blank screen) when any note with frontmatter is opened.
     EditorView.decorations.from(previewField),
+    // clicking a rendered [text](url) opens the URL (the URL itself is
+    // hidden — it rides along in a data attribute on the mark)
+    EditorView.domEventHandlers({
+      click(event, view) {
+        void view;
+        const t = event.target as HTMLElement | null;
+        const link = t?.closest?.(".md-link") as HTMLElement | null;
+        if (!link) return false;
+        const url = link.getAttribute("data-url") || "";
+        if (!/^https?:/i.test(url)) return false;
+        event.preventDefault();
+        openExternal(url);
+        return true;
+      },
+    }),
   ];
 }

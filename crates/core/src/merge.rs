@@ -48,6 +48,8 @@ mod tests {
             deleted,
             title: String::new(),
             preview: String::new(),
+            encrypted: false,
+            assets: Vec::new(),
         }
     }
 

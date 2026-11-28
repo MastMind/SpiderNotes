@@ -28,6 +28,9 @@ try {
   console.error("dist/ not found — run `vite build` first");
   process.exit(2);
 }
+const PKG_VERSION = JSON.parse(
+  readFileSync(path.join(appDir, "package.json"), "utf8")
+).version;
 const LONG = "x".repeat(400);
 const hlc = { ms: 1, counter: 0, device: "local" };
 // fixed "last sync" moment for the footer check (14.11.2023 22:13 UTC)
@@ -103,6 +106,8 @@ window.__TAURI_INTERNALS__ = {
     switch (cmd) {
       case "vault_status": return null;
       case "default_vault_path": return "/mock/vault";
+      case "plugin:dialog|open": return "/mock/picked-vault";
+      case "set_device_name": return { id: "localdev", name: args.name };
       case "open_vault":
         return { path: "/mock/vault", p2p_port: 8788, device_id: "localdev", device_name: "mock", notes: window.__mockNotesList, peers: [${JSON.stringify(mockPeer)}], folders: ["work"] };
       case "list_notes": return window.__mockNotesList;
@@ -141,6 +146,8 @@ window.__TAURI_INTERNALS__ = {
   unregisterCallback: (id) => { delete window.__cbs[id]; },
   convertFileSrc: (p) => "asset://" + p,
 };
+// @tauri-apps/api/event's unlisten() calls into the event plugin's internals
+window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
 `;
 
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".woff2": "font/woff2" };
@@ -242,6 +249,67 @@ const URL = "http://127.0.0.1:8129/";
 // ============ scenario 1: defaults (dark, 14px, line numbers ON) ============
 await loadWith(null, URL);
 
+// ---- vault picker: "Change vault…" queues a pending vault (applied at
+// the next launch); first launch offers a native folder picker ----
+await evalJs(`(() => {
+  const gear = Array.from(document.querySelectorAll("button")).find(b => b.title === "Network & log");
+  gear.click();
+  return "gear";
+})()`);
+await sleep(300);
+const cvBtn = await evalJs(`(() => {
+  const b = Array.from(document.querySelectorAll(".panel button")).find(x => x.textContent.trim() === "Change vault…");
+  b && b.click();
+  return !!b;
+})()`);
+await sleep(300);
+const pending1 = await evalJs(`(() => ({
+  banner: document.querySelector(".pending-vault") ? document.querySelector(".pending-vault").textContent : null,
+  ls: localStorage.getItem("sn.pendingVaultPath"),
+}))()`);
+check("settings: 'Change vault…' queues a pending vault + banner",
+  cvBtn === true && pending1.ls === "/mock/picked-vault" && pending1.banner && pending1.banner.includes("/mock/picked-vault"),
+  JSON.stringify(pending1));
+// relaunch: the pending vault opens automatically (no welcome screen,
+// banner gone, sn.vaultPath updated, pending cleared)
+await send("Page.navigate", { url: URL });
+await sleep(3000);
+const pending2 = await evalJs(`(() => ({
+  welcome: !!document.querySelector(".welcome"),
+  banner: !!document.querySelector(".pending-vault"),
+  vault: localStorage.getItem("sn.vaultPath"),
+  pending: localStorage.getItem("sn.pendingVaultPath"),
+  tree: !!document.querySelector(".tree-item"),
+}))()`);
+check("relaunch: pending vault auto-opens, welcome + banner gone",
+  pending2.welcome === false && pending2.banner === false && pending2.vault === "/mock/picked-vault" && pending2.pending === null && pending2.tree,
+  JSON.stringify(pending2));
+// fresh first launch (no saved path, panel closed): the folder picker
+// fills the input
+await evalJs(`localStorage.removeItem("sn.vaultPath"); localStorage.removeItem("sn.showNet")`);
+await send("Page.navigate", { url: URL });
+await sleep(3000);
+const pick = await evalJs(`(() => {
+  const b = Array.from(document.querySelectorAll(".welcome-card button")).find(x => x.textContent.trim() === "Choose folder…");
+  b && b.click();
+  return !!b;
+})()`);
+await sleep(300);
+const picked = await evalJs(`(() => {
+  const el = document.querySelector(".welcome-card input");
+  if (!el) return null;
+  return { tag: el.tagName, type: el.type, value: el.value, ctor: el.constructor ? el.constructor.name : "?" };
+})()`);
+check("first launch: 'Choose folder…' fills the vault path field",
+  pick === true && picked && picked.value === "/mock/picked-vault", `pick=${pick} ${JSON.stringify(picked)}`);
+// open it to restore the state for the remaining scenario 1 checks
+await evalJs(`(() => {
+  const b = Array.from(document.querySelectorAll(".welcome-card button")).find(x => /open.*vault/i.test(x.textContent));
+  b && b.click();
+  return !!b;
+})()`);
+await sleep(1500);
+
 await evalJs(`(() => {
   document.querySelector('button.tree-item[title="long.md"]').click();
   return "opened";
@@ -280,7 +348,7 @@ check("editor: full width of the main area", Math.abs(ed.editorWidth - ed.mainWi
 check("body font is monospace", /monospace/.test(ed.bodyFont), ed.bodyFont);
 check("editor font is monospace", /monospace/.test(ed.contentFont), ed.contentFont);
 check("line numbers gutter ON by default", ed.hasGutter);
-check("font size default 14px (body + editor)", ed.bodyFontSize === "14px" && ed.contentFontSize === "14px", `body=${ed.bodyFontSize} content=${ed.contentFontSize}`);
+check("font size default (body 15px chrome, note 14px)", ed.bodyFontSize === "15px" && ed.contentFontSize === "14px", `body=${ed.bodyFontSize} content=${ed.contentFontSize}`);
 
 // Montserrat on the UI chrome (bundled woff2, offline), monospace content
 const fonts = await evalJs(`document.fonts.ready.then(() => ({
@@ -576,6 +644,43 @@ await evalJs(`(() => {
   return !!c;
 })()`);
 await sleep(200);
+// device rename: pencil next to the name -> dialog -> set_device_name
+const devPencil = await evalJs(`(() => {
+  const b = document.querySelector(".selfdev .icon-btn");
+  b && b.click();
+  return !!b;
+})()`);
+await sleep(200);
+const devDlg = await evalJs(`(() => {
+  const d = document.querySelector(".dlg");
+  return {
+    open: !!d,
+    title: d ? (d.querySelector(".dlg-title") ? d.querySelector(".dlg-title").textContent : null) : null,
+    value: d && d.querySelector("input") ? d.querySelector("input").value : null,
+  };
+})()`);
+check("device rename: dialog opens with the current name",
+  devPencil === true && devDlg.open && devDlg.title === "Rename device" && devDlg.value === "mock",
+  JSON.stringify(devDlg));
+const devRenamed = await evalJs(`(() => {
+  const input = document.querySelector(".dlg input");
+  if (!input) return "no-input";
+  const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+  set.call(input, "Kitchen tablet");
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  const btn = Array.from(document.querySelectorAll(".dlg-actions button")).find(x => x.textContent.trim() === "Rename");
+  btn && btn.click();
+  return !!btn;
+})()`);
+await sleep(300);
+const devAfter = await evalJs(`(() => ({
+  name: document.querySelector(".selfdev .peer-name") ? document.querySelector(".selfdev .peer-name").textContent : null,
+  dlg: !!document.querySelector(".dlg"),
+  args: window.__invokeArgs.filter(a => a[0] === "set_device_name").map(a => a[1]),
+}))()`);
+check("device rename: set_device_name called + UI updated",
+  devRenamed === true && devAfter.name === "Kitchen tablet" && devAfter.dlg === false && devAfter.args.length === 1 && devAfter.args[0].name === "Kitchen tablet",
+  JSON.stringify(devAfter));
 const d1 = await evalJs(`(() => {
   const btn = Array.from(document.querySelectorAll("button")).find(b => /visual settings/i.test(b.textContent));
   if (!btn) return { found: false };
@@ -652,9 +757,9 @@ const fs16 = await evalJs(`(() => ({
   val: document.querySelector(".design-body .range-val").textContent,
   ls: localStorage.getItem("sn.fontSize"),
 }))()`);
-// the slider scales the NOTE TEXT only; the UI chrome keeps 14px
-check("Visual: font size slider scales the note text only (body stays 14px)",
-  fs16.body === "14px" && fs16.content === "16px" && fs16.gutter === "16px" && fs16.val === "16" && fs16.ls === "16",
+// the slider scales the NOTE TEXT only; the UI chrome keeps its base size
+check("Visual: font size slider scales the note text only (body stays 15px)",
+  fs16.body === "15px" && fs16.content === "16px" && fs16.gutter === "16px" && fs16.val === "16" && fs16.ls === "16",
   JSON.stringify(fs16));
 
 // editor view select: switch to raw, persisted
@@ -719,7 +824,7 @@ const p2 = await evalJs(`(() => ({
   fg: getComputedStyle(document.body).color,
 }))()`);
 check("persisted: theme forest applied on load", p2.dataTheme === "forest", p2.dataTheme);
-check("persisted: note font size 17px (body stays 14px)", p2.bodyFs === "14px" && p2.contentFs === "17px", `body=${p2.bodyFs} content=${p2.contentFs}`);
+check("persisted: note font size 17px (body stays 15px)", p2.bodyFs === "15px" && p2.contentFs === "17px", `body=${p2.bodyFs} content=${p2.contentFs}`);
 check("persisted: line numbers stay off", !p2.gutter);
 
 // ============ scenario 3: mobile full-screen sidebar, swipes only ============
@@ -759,9 +864,10 @@ const mb2 = await evalJs(`(() => {
 check("mobile: right swipe (anywhere) opens the full-screen overlay",
   swipeOpen === true && mb2.pos === "fixed" && mb2.w >= mb2.vw - 1 && mb2.h >= mb2.vh - 1 && mb2.left === 0 && mb2.top === 0,
   JSON.stringify(mb2));
-// close with a left swipe inside the list — the overlay slides off to the left
+// close with a left swipe inside the list (NOT on a note row — rows
+// have their own left-swipe actions) — the overlay slides off to the left
 const swipeClose = await evalJs(`(() => {
-  const target = document.querySelector(".sidebar .tree-item") || document.querySelector(".side-top");
+  const target = document.querySelector(".side-top") || document.querySelector(".sidebar .tree-dir");
   const t1 = new Touch({ identifier: 22, target, clientX: 300, clientY: 400, pageX: 300, pageY: 400 });
   target.dispatchEvent(new TouchEvent("touchstart", { bubbles: true, cancelable: true, touches: [t1], targetTouches: [t1], changedTouches: [t1] }));
   const t2 = new Touch({ identifier: 22, target, clientX: 100, clientY: 400, pageX: 100, pageY: 400 });
@@ -807,6 +913,38 @@ const regPost = await evalJs(`(() => {
 check("mobile: swipe opens the list even with a note open (editor covers the screen)",
   regPre.closed && regPre.editorAtPoint && swipeOpen2 === true && regPost.left === 0 && regPost.top === 0,
   `pre=${JSON.stringify(regPre)} post=${JSON.stringify(regPost)}`);
+// settings panel: the version line shows <version>-alpha + build sha
+await evalJs(`(() => {
+  const gear = Array.from(document.querySelectorAll("button")).find(b => b.title === "Network & log");
+  gear.click();
+  return "gear";
+})()`);
+await sleep(300);
+const panelVer = await evalJs(`(() => {
+  const p = document.querySelector(".panel");
+  if (!p) return { found: false };
+  const line = Array.from(p.querySelectorAll(".muted")).find(d => d.textContent.includes("alpha · build"));
+  return { found: !!line, text: line ? line.textContent : null };
+})()`);
+check("panel: version line shows <version>-alpha + build sha",
+  panelVer.found && panelVer.text === `${PKG_VERSION}-alpha · build local`,
+  JSON.stringify(panelVer));
+// a right swipe on the panel (start + move + end, dx > 80) closes it,
+// besides the X
+const swipePanel = await evalJs(`(() => {
+  const p = document.querySelector(".panel");
+  if (!p) return "no-panel";
+  const t1 = new Touch({ identifier: 31, target: p, clientX: 100, clientY: 400, pageX: 100, pageY: 400 });
+  p.dispatchEvent(new TouchEvent("touchstart", { bubbles: true, cancelable: true, touches: [t1], targetTouches: [t1], changedTouches: [t1] }));
+  const t2 = new Touch({ identifier: 31, target: p, clientX: 180, clientY: 400, pageX: 180, pageY: 400 });
+  p.dispatchEvent(new TouchEvent("touchmove", { bubbles: true, cancelable: true, touches: [t2], targetTouches: [t2], changedTouches: [t2] }));
+  const t3 = new Touch({ identifier: 31, target: p, clientX: 220, clientY: 400, pageX: 220, pageY: 400 });
+  p.dispatchEvent(new TouchEvent("touchend", { bubbles: true, cancelable: true, touches: [], targetTouches: [], changedTouches: [t3] }));
+  return true;
+})()`);
+await sleep(450);
+const panelGone = await evalJs(`(() => !document.querySelector(".panel"))()`);
+check("panel: right swipe closes the settings panel", swipePanel === true && panelGone, `swipe=${swipePanel} gone=${panelGone}`);
 
 await send("Emulation.clearDeviceMetricsOverride");
 chrome.kill();

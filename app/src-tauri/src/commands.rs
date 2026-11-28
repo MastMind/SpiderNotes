@@ -1,6 +1,7 @@
 use crate::server_sync::restart_server_sync;
 use crate::state::{persist_peers, AppState, MDNS_REFRESH_SECS, PUSH_DEBOUNCE_MS};
-use spidernotes_core::{Note, NoteSummary, Vault};
+use base64::Engine;
+use spidernotes_core::{AssetReport, Note, NoteSummary, Vault};
 use spidernotes_p2p::agent::{
     capped_initiator, capped_responder, is_busy_error, SyncReport as P2pSyncReport,
 };
@@ -24,6 +25,10 @@ pub struct OpenResult {
     pub peers: Vec<PeerInfo>,
     /// Vault folders (relative slash-separated paths), including empty ones.
     pub folders: Vec<String>,
+    /// Local media-server port (127.0.0.1), 0 when it is not running.
+    /// `<video>`/`<audio>` resolve to http://127.0.0.1:<port>/<rel> because
+    /// WebKit's media pipeline cannot play large files from asset:/blob:.
+    pub media_port: u16,
 }
 
 #[derive(serde::Serialize)]
@@ -43,6 +48,8 @@ pub struct P2pSettings {
     pub p2p_running: bool,
     /// Unix seconds of the last successful sync, `None` when never.
     pub last_sync: Option<u64>,
+    /// Download media files from peers (notes sync regardless).
+    pub download_media: bool,
 }
 
 /// Relay-server state for the UI. The secret is intentionally never
@@ -72,6 +79,16 @@ pub struct TagCount {
 
 fn vault_or_err(st: &AppState) -> Result<Vault, String> {
     st.take_vault().ok_or_else(|| "vault is not open".to_string())
+}
+
+/// Destructive operations on an ENCRYPTED note (delete / move) require the
+/// note to be unlocked first — the frontend catches this error, asks for
+/// the password, calls `unlock_note`, and retries. Plain notes pass through.
+fn require_unlocked(v: &Vault, st: &AppState, u: &Uuid) -> Result<(), String> {
+    if v.get(u).is_some_and(|s| s.encrypted && !s.deleted) && st.note_key(u).is_none() {
+        return Err("note is locked: enter its password first".to_string());
+    }
+    Ok(())
 }
 
 fn expand_tilde(p: &str) -> String {
@@ -154,7 +171,7 @@ async fn sync_vault_with_peers(
                     tracing::warn!("sync: relay not connected, skipping {}", p.name);
                     break;
                 };
-                capped_initiator(stream, &st.identity, p.x25519_pub, &mut v, SYNC_PROTOCOL_TIMEOUT)
+                capped_initiator(stream, &st.identity, p.x25519_pub, &mut v, SYNC_PROTOCOL_TIMEOUT, st.download_media.load(Ordering::SeqCst))
                     .await
             } else {
                 let Some(addr) = parse_peer_addr(&p.address, p.port) else {
@@ -173,7 +190,7 @@ async fn sync_vault_with_peers(
                             break;
                         }
                     };
-                capped_initiator(stream, &st.identity, p.x25519_pub, &mut v, SYNC_PROTOCOL_TIMEOUT)
+                capped_initiator(stream, &st.identity, p.x25519_pub, &mut v, SYNC_PROTOCOL_TIMEOUT, st.download_media.load(Ordering::SeqCst))
                     .await
             };
             match res {
@@ -345,6 +362,7 @@ fn start_p2p(
     let gate_r = st.sync_gate.clone();
     let app_r = app.clone();
     let trust_r = st.trust.clone();
+    let download_media_r = st.download_media.clone();
     let last_r = st.last_sync.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(stream) = conn_rx.recv().await {
@@ -365,8 +383,15 @@ fn start_p2p(
             if let Err(e) = vault.scan_and_repair() {
                 tracing::warn!("pre-sync scan: {e}");
             }
-            match capped_responder(stream, &identity, &mut vault, &trust_r, SYNC_PROTOCOL_TIMEOUT)
-                .await
+            match capped_responder(
+                stream,
+                &identity,
+                &mut vault,
+                &trust_r,
+                SYNC_PROTOCOL_TIMEOUT,
+                download_media_r.load(Ordering::SeqCst),
+            )
+            .await
             {
                 Ok(report) => {
                     tracing::info!(
@@ -518,9 +543,39 @@ pub async fn do_open_vault(
     if let Err(e) = vault.scan_and_repair() {
         tracing::warn!("vault scan: {e}");
     }
-    let notes = vault.live_notes();
+    let notes = vault.visible_notes();
     let folders = vault.list_folders();
     let root = vault.root().to_string_lossy().to_string();
+    // make the vault's files reachable through the asset protocol so the
+    // editor can render markdown images/media with local paths
+    let _ = app.asset_protocol_scope().allow_directory(&root, true);
+    // the scope's glob matching uses require_literal_leading_dot (default
+    // on unix: dotfiles are not exposed by default), so `<root>/**` does NOT
+    // match dot-prefixed components — without this extra pattern every
+    // asset: request for the hidden media dir answers 403
+    let _ = app
+        .asset_protocol_scope()
+        .allow_directory(vault.root().join(".assets"), true);
+    // a fresh vault session invalidates any previously held note keys
+    st.lock_all_notes();
+    // Serve the vault's hidden media dir over loopback HTTP: WebKit's media
+    // pipeline cannot play large files from the asset: scheme (it probes
+    // with a Range request that the protocol answers and then gives up) nor
+    // from a large blob: URL — plain HTTP works (see media_server.rs).
+    if let Some(old) = st.media_server.lock().unwrap().take() {
+        old.stop();
+    }
+    let media_port = match crate::media_server::start(&vault.root().join(".assets")).await {
+        Ok(s) => {
+            let port = s.port;
+            *st.media_server.lock().unwrap() = Some(s);
+            port
+        }
+        Err(e) => {
+            tracing::warn!("media server: {e}");
+            0
+        }
+    };
     let peers = st.merged_peers();
     st.put_vault(vault);
     Ok(OpenResult {
@@ -531,6 +586,7 @@ pub async fn do_open_vault(
         notes,
         peers,
         folders,
+        media_port,
     })
 }
 
@@ -573,14 +629,22 @@ pub fn vault_status(app: AppHandle) -> Result<Option<OpenResult>, String> {
             return Ok(None);
         };
         let peers = st.merged_peers();
+        let media_port = st
+            .media_server
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.port)
+            .unwrap_or(0);
         Ok(Some(OpenResult {
             path: v.root().to_string_lossy().to_string(),
             p2p_port: st.p2p_port.load(Ordering::SeqCst),
             device_id: st.identity.id.clone(),
             device_name: st.identity.name.clone(),
-            notes: v.live_notes(),
+            notes: v.visible_notes(),
             peers,
             folders: v.list_folders(),
+            media_port,
         }))
     }
 }
@@ -588,7 +652,7 @@ pub fn vault_status(app: AppHandle) -> Result<Option<OpenResult>, String> {
 #[tauri::command]
 pub fn list_notes(app: AppHandle) -> Result<Vec<NoteSummary>, String> {
     let st = (*app.state::<AppState>()).clone();
-    Ok(vault_or_err(&st)?.live_notes())
+    Ok(vault_or_err(&st)?.visible_notes())
 }
 
 #[tauri::command]
@@ -596,7 +660,79 @@ pub fn read_note(app: AppHandle, uuid: String) -> Result<Note, String> {
     let st = (*app.state::<AppState>()).clone();
     let v = vault_or_err(&st)?;
     let u: Uuid = uuid.parse::<Uuid>().map_err(|e| e.to_string())?;
-    v.read(&u).map_err(|e| e.to_string())
+    let n = v.read(&u).map_err(|e| e.to_string())?;
+    // Encrypted notes: the file holds ciphertext. Return the plaintext only
+    // while the note is unlocked (its key is held in memory); otherwise the
+    // frontend must ask for the password (unlock_note) first.
+    if v.get(&u).is_some_and(|s| s.encrypted) {
+        let key = st
+            .note_key(&u)
+            .ok_or_else(|| "note is locked: enter its password first".to_string())?;
+        let body = spidernotes_core::crypto::body_bytes(&n.content)
+            .map_err(|e| e.to_string())?;
+        let plain = spidernotes_core::crypto::decrypt_payload(&body, &key)
+            .map_err(|e| e.to_string())?;
+        return Ok(Note {
+            content: plain,
+            ..n
+        });
+    }
+    Ok(n)
+}
+
+/// Create a NEW ENCRYPTED note. Derives the key from the password, writes
+/// the ciphertext file, and keeps the key in memory (the note is created
+/// already "unlocked", so the editor can show the plaintext immediately).
+#[tauri::command]
+pub async fn create_encrypted_note(
+    app: AppHandle,
+    path: String,
+    password: String,
+) -> Result<NoteSummary, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let _gate = st.sync_gate.lock().await;
+    let mut v = vault_or_err(&st)?;
+    let rel = spidernotes_core::vault::normalize_rel_path(&path).map_err(|e| e.to_string())?;
+    let name = rel
+        .trim_end_matches(".md")
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let plain = format!("# {name}\n");
+    let (file, key) = spidernotes_core::crypto::create(&plain, &name, &password)
+        .map_err(|e| e.to_string())?;
+    let s = v.write(&path, &file).map_err(|e| e.to_string())?;
+    st.unlock_note(s.uuid, key);
+    st.put_vault(v);
+    // clone: `_gate` borrows `st` until end of scope
+    schedule_push(app, st.clone());
+    Ok(s)
+}
+
+/// Unlock an encrypted note: verify the password (a wrong one fails the
+/// GCM tag) and return the PLAINTEXT for the editor, keeping the derived
+/// key in memory until `lock_note`.
+#[tauri::command]
+pub fn unlock_note(app: AppHandle, uuid: String, password: String) -> Result<String, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let v = vault_or_err(&st)?;
+    let u: Uuid = uuid.parse::<Uuid>().map_err(|e| e.to_string())?;
+    let n = v.read(&u).map_err(|e| e.to_string())?;
+    let (plain, key) =
+        spidernotes_core::crypto::unlock(&n.content, &password).map_err(|e| e.to_string())?;
+    st.unlock_note(u, key);
+    Ok(plain)
+}
+
+/// Lock an encrypted note: drop its held key. Subsequent reads/saves of it
+/// fail until it is unlocked again.
+#[tauri::command]
+pub fn lock_note(app: AppHandle, uuid: String) -> Result<(), String> {
+    let st = (*app.state::<AppState>()).clone();
+    let u: Uuid = uuid.parse::<Uuid>().map_err(|e| e.to_string())?;
+    st.lock_note(&u);
+    Ok(())
 }
 
 // Mutations (save/delete/rename) must hold `sync_gate`: an in-flight sync
@@ -614,7 +750,24 @@ pub async fn save_note(
     let st = (*app.state::<AppState>()).clone();
     let _gate = st.sync_gate.lock().await;
     let mut v = vault_or_err(&st)?;
-    let s = v.write(&path, &content).map_err(|e| e.to_string())?;
+    // Encrypted notes: the editor holds plaintext, the file must hold
+    // ciphertext. Re-encrypt with the held key (the note must be unlocked).
+    // The title metadata is re-derived from the plaintext's heading.
+    let rel = spidernotes_core::vault::normalize_rel_path(&path).map_err(|e| e.to_string())?;
+    let existing = v.live_notes().into_iter().find(|n| n.path == rel);
+    let file = match existing.filter(|s| s.encrypted) {
+        Some(s) => {
+            let key = st
+                .note_key(&s.uuid)
+                .ok_or_else(|| "note is locked: enter its password first".to_string())?;
+            let raw = v.read(&s.uuid).map_err(|e| e.to_string())?;
+            let (title, _) = spidernotes_core::note::title_preview(&content);
+            spidernotes_core::crypto::reencrypt(&raw.content, &title, &content, &key)
+                .map_err(|e| e.to_string())?
+        }
+        None => content.clone(),
+    };
+    let s = v.write(&path, &file).map_err(|e| e.to_string())?;
     st.put_vault(v);
     // clone: `_gate` borrows `st` until end of scope
     schedule_push(app, st.clone());
@@ -627,7 +780,11 @@ pub async fn delete_note(app: AppHandle, uuid: String) -> Result<NoteSummary, St
     let _gate = st.sync_gate.lock().await;
     let mut v = vault_or_err(&st)?;
     let u: Uuid = uuid.parse::<Uuid>().map_err(|e| e.to_string())?;
+    // deleting an encrypted note requires its password (the frontend asks
+    // and unlocks first) — a deliberate confirmation, not a security wall
+    require_unlocked(&v, &st, &u)?;
     let s = v.delete(&u).map_err(|e| e.to_string())?;
+    st.lock_note(&u);
     st.put_vault(v);
     // clone: `_gate` borrows `st` until end of scope
     schedule_push(app, st.clone());
@@ -639,16 +796,142 @@ pub async fn rename_note(
     app: AppHandle,
     uuid: String,
     new_path: String,
+    new_title: Option<String>,
 ) -> Result<NoteSummary, String> {
     let st = (*app.state::<AppState>()).clone();
     let _gate = st.sync_gate.lock().await;
     let mut v = vault_or_err(&st)?;
     let u: Uuid = uuid.parse::<Uuid>().map_err(|e| e.to_string())?;
-    let s = v.rename(&u, &new_path).map_err(|e| e.to_string())?;
+    // moving an encrypted note requires its password first (the core also
+    // rejects title rewrites of encrypted notes outright)
+    require_unlocked(&v, &st, &u)?;
+    let s = v
+        .rename(&u, &new_path, new_title.as_deref())
+        .map_err(|e| e.to_string())?;
+    st.lock_note(&u);
     st.put_vault(v);
     // clone: `_gate` borrows `st` until end of scope
     schedule_push(app, st.clone());
     Ok(s)
+}
+
+/// Store a dropped media file (image / audio / video) into the vault's
+ /// hidden `.assets/` dir and return its relative slash-separated path —
+ /// the value the frontend puts into the `![alt](src)` markdown. Files are
+ /// NOT notes: they are not indexed, scanned or synced (only the markdown
+ /// referencing them travels with the note).
+#[tauri::command]
+pub async fn import_media_file(
+    app: AppHandle,
+    name: String,
+    b64: String,
+) -> Result<String, String> {
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(&b64)
+        .map_err(|e| format!("invalid file data: {e}"))?;
+    let st = (*app.state::<AppState>()).clone();
+    let _gate = st.sync_gate.lock().await;
+    let root = st
+        .take_vault()
+        .map(|v| v.root().to_path_buf())
+        .ok_or_else(|| "vault is not open".to_string())?;
+    let assets = root.join(".assets");
+    std::fs::create_dir_all(&assets).map_err(|e| e.to_string())?;
+    let path = unique_media_path(&assets, &media_file_name(&name), &data);
+    std::fs::write(&path, &data).map_err(|e| e.to_string())?;
+    // ISO-BMFF files (mp4/mov/m4a/...) whose index (`moov`) sits at the
+    // END of the file cannot be played by the web media pipeline — it
+    // consumes the source as a non-seekable stream and stalls after the
+    // first frame. Move `moov` to the front (faststart, as
+    // `ffmpeg -movflags +faststart` does) so playback starts right away.
+    if data.get(4..8) == Some(b"ftyp".as_slice()) {
+        if let Err(e) = spidernotes_core::faststart::make_faststart(&path) {
+            tracing::warn!("faststart rewrite failed for {}: {e}", path.display());
+        }
+    }
+    Ok(format!(
+        ".assets/{}",
+        path.file_name().unwrap().to_string_lossy()
+    ))
+}
+
+/// Orphan-asset report for the settings panel (scanned after autosave).
+/// Encrypted notes whose key we currently hold are decrypted and checked;
+/// the rest count into `encrypted_unchecked` (the UI warns about them).
+#[tauri::command]
+pub fn asset_report(app: AppHandle) -> Result<AssetReport, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let v = vault_or_err(&st)?;
+    let mut decrypted: Vec<(Uuid, String)> = Vec::new();
+    for s in v.live_notes() {
+        if !s.encrypted {
+            continue;
+        }
+        let Some(key) = st.note_key(&s.uuid) else { continue };
+        let Ok(n) = v.read(&s.uuid) else { continue };
+        let plain = spidernotes_core::crypto::body_bytes(&n.content)
+            .ok()
+            .and_then(|b| spidernotes_core::crypto::decrypt_payload(&b, &key).ok());
+        if let Some(p) = plain {
+            decrypted.push((s.uuid, p));
+        }
+    }
+    Ok(v.asset_report(&decrypted))
+}
+
+/// Delete asset files (the core guards to paths under assets/). Called by
+/// the "clean up unused assets" dialog after an explicit user confirmation.
+#[tauri::command]
+pub async fn delete_assets(app: AppHandle, paths: Vec<String>) -> Result<u64, String> {
+    let st = (*app.state::<AppState>()).clone();
+    let _gate = st.sync_gate.lock().await;
+    let v = vault_or_err(&st)?;
+    v.delete_assets(&paths).map_err(|e| e.to_string())
+}
+
+/// A dropped file's name reduced to a safe single path component
+/// (drag-and-drop may deliver a full path; control/Windows-illegal
+/// characters are dropped; an empty result becomes "file").
+fn media_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// `dir/name`, or `dir/name-N.ext` when a DIFFERENT file already holds the
+/// name (identical bytes reuse the existing file — dropping the same image
+/// twice must not create a copy).
+fn unique_media_path(dir: &std::path::Path, name: &str, data: &[u8]) -> std::path::PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    if std::fs::read(&candidate)
+        .map(|b| b == data)
+        .unwrap_or(false)
+    {
+        return candidate;
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name, ""),
+    };
+    let mut n = 1u32;
+    loop {
+        let candidate = dir.join(format!("{stem}-{n}{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 #[tauri::command]
@@ -712,7 +995,7 @@ pub async fn rescan(app: AppHandle) -> Result<Vec<NoteSummary>, String> {
     let _gate = st.sync_gate.lock().await;
     let mut v = vault_or_err(&st)?;
     v.scan_and_repair().map_err(|e| e.to_string())?;
-    let notes = v.live_notes();
+    let notes = v.visible_notes();
     st.put_vault(v);
     Ok(notes)
 }
@@ -799,6 +1082,38 @@ pub fn device_info(app: AppHandle) -> Result<DeviceInfo, String> {
     })
 }
 
+/// Rename this device. Persists to the identity file; peers see the new
+/// name in the p2p Hello of the next app launch (the running P2P agent
+/// keeps its startup identity until then).
+#[tauri::command]
+pub fn set_device_name(app: AppHandle, name: String) -> Result<DeviceInfo, String> {
+    let clean = name.trim().to_string();
+    if clean.is_empty() || clean.chars().count() > 40 {
+        return Err("device name must be 1-40 characters".to_string());
+    }
+    let st = (*app.state::<AppState>()).clone();
+    let mut identity = st.identity.clone();
+    identity.name = clean.clone();
+    #[cfg(mobile)]
+    {
+        // Must match where lib.rs loads it: `load_or_create_in(&name, &dir)`
+        // joins "spidernotes" onto the app data dir, so the file lives at
+        // `<app_data>/spidernotes/identity.json`. Saving to `<app_data>`
+        // directly (the old code) wrote a file the startup never reads, so the
+        // rename was lost on restart and peers kept seeing the old name.
+        let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        identity.save_in(&dir.join("spidernotes")).map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(mobile))]
+    {
+        identity.save().map_err(|e| e.to_string())?;
+    }
+    Ok(DeviceInfo {
+        id: identity.id.clone(),
+        name: clean,
+    })
+}
+
 #[tauri::command]
  pub fn list_peers(app: AppHandle) -> Result<Vec<PeerInfo>, String> {
     let st = (*app.state::<AppState>()).clone();
@@ -831,16 +1146,39 @@ pub fn device_info(app: AppHandle) -> Result<DeviceInfo, String> {
   }
 
  #[tauri::command]
- pub fn untrust_device(app: AppHandle, device_id: String)
- -> Result<Vec<spidernotes_core::TrustedDevice>, String> {
+  pub fn untrust_device(app: AppHandle, device_id: String)
+  -> Result<Vec<spidernotes_core::TrustedDevice>, String> {
     let st = (*app.state::<AppState>()).clone();
      if let Err(e) = st.trust.remove(&device_id) {
-         tracing::error!("untrust_device failed for {device_id}: {e}");
-         return Err(format!("cannot save trust list: {e}"));
-     }
-   tracing::info!("untrusted device {device_id}");
-     Ok(st.trust.list())
-   }
+          tracing::error!("untrust_device failed for {device_id}: {e}");
+          return Err(format!("cannot save trust list: {e}"));
+      }
+    tracing::info!("untrusted device {device_id}");
+      Ok(st.trust.list())
+    }
+
+ /// Set a LOCAL display name for a peer (this device only: the override never
+ /// travels over the wire, the peer keeps advertising its own name). The UI
+ /// list refreshes through the peers-updated event; it applies regardless of
+ /// whether the peer is trusted.
+  #[tauri::command]
+  pub fn rename_peer(app: AppHandle, device_id: String, name: String) -> Result<(), String> {
+    let clean = name.trim().to_string();
+    if clean.is_empty() || clean.chars().count() > 40 {
+      return Err("peer name must be 1-40 characters".to_string());
+    }
+    if device_id == app.state::<AppState>().identity.id {
+      return Err("that is this device — rename it in My device instead".into());
+    }
+    let st = (*app.state::<AppState>()).clone();
+    if let Err(e) = st.peer_names.set(&device_id, &clean) {
+      tracing::error!("rename_peer failed for {device_id}: {e}");
+      return Err(format!("cannot save peer names: {e}"));
+    }
+    tracing::info!("peer {device_id} shows as {clean}");
+    emit_peers(&app, &st);
+    Ok(())
+  }
 
 #[tauri::command]
 pub fn p2p_settings(app: AppHandle) -> Result<P2pSettings, String> {
@@ -852,7 +1190,19 @@ pub fn p2p_settings(app: AppHandle) -> Result<P2pSettings, String> {
         p2p_port_setting: st.p2p_port_setting.load(Ordering::SeqCst),
         p2p_running: st.p2p_running.load(Ordering::SeqCst),
         last_sync: (last != 0).then_some(last),
+        download_media: st.download_media.load(Ordering::SeqCst),
     })
+}
+
+/// Allow/refuse storing media files that arrive attached to synced notes.
+/// Notes themselves always sync; this only gates the .assets/ bytes. The
+/// choice is per-device and takes effect from the next sync round.
+#[tauri::command]
+pub fn set_download_media(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    let st = (*app.state::<AppState>()).clone();
+    st.download_media.store(enabled, Ordering::SeqCst);
+    tracing::info!("download media {enabled}");
+    Ok(enabled)
 }
 
 #[tauri::command]
@@ -1035,7 +1385,7 @@ pub async fn sync_with(app: AppHandle, peer: PeerInfo) -> Result<P2pSyncReport, 
             let stream = handle
                 .and_then(|h| h.open_session(&peer.device_id))
                 .ok_or_else(|| "relay server is not connected".to_string())?;
-            capped_initiator(stream, &st.identity, peer.x25519_pub, &mut v, SYNC_PROTOCOL_TIMEOUT)
+            capped_initiator(stream, &st.identity, peer.x25519_pub, &mut v, SYNC_PROTOCOL_TIMEOUT, st.download_media.load(Ordering::SeqCst))
                 .await
         } else {
             let addr = parse_peer_addr(&peer.address, peer.port)
@@ -1044,7 +1394,7 @@ pub async fn sync_with(app: AppHandle, peer: PeerInfo) -> Result<P2pSyncReport, 
                 .await
                 .map_err(|_| format!("connect timeout to {addr}"))?
                 .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
-            capped_initiator(stream, &st.identity, peer.x25519_pub, &mut v, SYNC_PROTOCOL_TIMEOUT)
+            capped_initiator(stream, &st.identity, peer.x25519_pub, &mut v, SYNC_PROTOCOL_TIMEOUT, st.download_media.load(Ordering::SeqCst))
                 .await
         };
         match res {

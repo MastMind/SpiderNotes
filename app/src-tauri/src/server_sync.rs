@@ -10,6 +10,7 @@ use spidernotes_p2p::relay::{RelayStream, RosterPeer};
 use spidernotes_p2p::server_client::{ServerClient, ServerEvent};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
@@ -184,8 +185,15 @@ fn spawn_server_responder(
         if let Err(e) = vault.scan_and_repair() {
             tracing::warn!("pre-sync scan: {e}");
         }
-        match capped_responder(stream, &st.identity, &mut vault, &st.trust, SYNC_PROTOCOL_TIMEOUT)
-            .await
+        match capped_responder(
+            stream,
+            &st.identity,
+            &mut vault,
+            &st.trust,
+            SYNC_PROTOCOL_TIMEOUT,
+            st.download_media.load(Ordering::SeqCst),
+        )
+        .await
         {
             Ok(report) => {
                 tracing::info!(

@@ -330,7 +330,15 @@ impl Node {
             let stream = h
                 .and_then(|h| h.open_session(&peer.device_id))
                 .ok_or_else(|| "relay server is not connected".to_string())?;
-            match capped_initiator(stream, &self.identity, peer.x25519_pub, &mut v, SYNC_TIMEOUT).await
+            match capped_initiator(
+                stream,
+                &self.identity,
+                peer.x25519_pub,
+                &mut v,
+                SYNC_TIMEOUT,
+                true,
+            )
+            .await
             {
                 Ok(r) => {
                     *self.vault.lock().unwrap() = v;
@@ -475,6 +483,7 @@ async fn relay_loop(
                                     events.clone(),
                                     devid,
                                     stream,
+                                    true,
                                 );
                             }
                             None => break, // relay connection lost
@@ -514,6 +523,7 @@ fn spawn_responder(
     events: Arc<Mutex<Vec<String>>>,
     devid: String,
     stream: RelayStream,
+    download_media: bool,
 ) {
     tokio::spawn(async move {
         let Ok(_gate) = gate.try_lock() else {
@@ -526,7 +536,7 @@ fn spawn_responder(
         if let Err(e) = v.scan_and_repair() {
             log(&events, &format!("{name}: pre-sync scan: {e}"));
         }
-        match capped_responder(stream, &identity, &mut v, &trust, SYNC_TIMEOUT).await {
+        match capped_responder(stream, &identity, &mut v, &trust, SYNC_TIMEOUT, download_media).await {
             Ok(r) => {
                 log(
                     &events,
@@ -614,7 +624,10 @@ async fn sync_vault_with_peers(
                     log(events, &format!("{name}: relay not connected, skipping {}", p.name));
                     break;
                 }
-                Some(stream) => capped_initiator(stream, identity, p.x25519_pub, &mut v, SYNC_TIMEOUT).await,
+                Some(stream) => {
+                    capped_initiator(stream, identity, p.x25519_pub, &mut v, SYNC_TIMEOUT, true)
+                        .await
+                }
             };
             match res {
                 Ok(r) => {

@@ -462,7 +462,7 @@ mod tests {
             let id_a = id_a.clone();
             async move {
                 let mut v = vault_a;
-                sync_initiator(stream, &id_a, b_pub, &mut v).await
+                sync_initiator(stream, &id_a, b_pub, &mut v, true).await
             }
         });
 
@@ -481,7 +481,7 @@ mod tests {
             let id_b = id_b.clone();
             async move {
                 let mut v = vault_b;
-                let r = sync_responder(incoming, &id_b, &mut v, &trust_b).await;
+                let r = sync_responder(incoming, &id_b, &mut v, &trust_b, true).await;
                 (r, v)
             }
         });
@@ -625,7 +625,7 @@ mod tests {
         let stream = handle_a.open_session(&id_b.id).expect("open session");
         let sync_task = tokio::spawn({
             let id_a = id_a.clone();
-            async move { sync_initiator(stream, &id_a, b_pub, &mut vault_a).await }
+            async move { sync_initiator(stream, &id_a, b_pub, &mut vault_a, true).await }
         });
 
         // B's read loop surfaces the incoming session; play the busy

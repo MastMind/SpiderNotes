@@ -130,6 +130,8 @@ window.__TAURI_INTERNALS__ = {
   unregisterCallback: (id) => { delete window.__cbs[id]; },
   convertFileSrc: (p) => "asset://" + p,
 };
+// @tauri-apps/api/event's unlisten() calls into the event plugin's internals
+window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
 `;
 
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png", ".woff2": "font/woff2" };
@@ -309,6 +311,54 @@ const ctxMenu = await evalJs(`(() => {
 check("folder context menu opens", ctx === "dispatched" && Array.isArray(ctxMenu), JSON.stringify(ctxMenu));
 check("folder menu has actions", Array.isArray(ctxMenu) && ctxMenu.includes("New folder inside") && ctxMenu.includes("Rename folder") && ctxMenu.includes("Delete folder"), JSON.stringify(ctxMenu));
 
+// ---- 3b. folder delete opens an IN-APP confirm (not window.confirm) and
+// deletes only after confirming ----
+await evalJs(`document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }))`);
+const fctx = await evalJs(`(() => {
+  const s = Array.from(document.querySelectorAll("summary.tree-dir")).find(s => s.querySelector(".dir-name")?.textContent === "empty-folder");
+  if (!s) return "no folder";
+  const r = s.getBoundingClientRect();
+  s.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: r.x + 10, clientY: r.y + 5 }));
+  return "dispatched";
+})()`);
+await sleep(250);
+// the menu renders on the next tick: click "Delete folder" in a separate step
+const fctxItem = await evalJs(`(() => {
+  const m = document.querySelector(".ctx-menu");
+  const del = m && Array.from(m.querySelectorAll(".ctx-item")).find(b => b.textContent.trim() === "Delete folder");
+  del && del.click();
+  return !!del;
+})()`);
+await sleep(300);
+const fdelDlg = await evalJs(`(() => ({
+  dlg: !!Array.from(document.querySelectorAll(".dlg-title")).find(t => /delete folder/i.test(t.textContent)),
+  deleted: window.__invokeArgs.filter(a => a.cmd === "delete_folder").length,
+}))()`);
+if (fctx !== "dispatched" || !fctxItem || !fdelDlg.dlg || fdelDlg.deleted > 0) {
+  console.log("FAIL: folder delete must open the in-app confirm FIRST (no premature delete)", `ctx=${fctx} item=${fctxItem}`, JSON.stringify(fdelDlg));
+  fail++;
+}
+await evalJs(`(() => {
+  const dlg = Array.from(document.querySelectorAll(".dlg-title")).find(t => /delete folder/i.test(t.textContent));
+  const card = dlg && dlg.closest(".dlg");
+  const del = card && Array.from(card.querySelectorAll(".dlg-actions button")).find(b => /delete/i.test(b.textContent));
+  del && del.click();
+  return !!del;
+})()`);
+let fdelArgs = null;
+for (let i = 0; i < 20; i++) {
+  fdelArgs = await evalJs(`(() => {
+    const rs = window.__invokeArgs.filter(a => a.cmd === "delete_folder");
+    return rs.length ? rs[rs.length - 1].args : null;
+  })()`);
+  if (fdelArgs && fdelArgs.path === "empty-folder") break;
+  await sleep(100);
+}
+if (!fdelArgs || fdelArgs.path !== "empty-folder") {
+  console.log("FAIL: confirming the folder delete deletes exactly that folder", JSON.stringify(fdelArgs));
+  fail++;
+}
+
 // ---- 4. right-click on a note: Move to… / Delete ----
 await evalJs(`document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }))`);
 const nctx = await evalJs(`(() => {
@@ -345,6 +395,141 @@ const mvArgs = await evalJs(`(() => {
   return rs.length ? rs[rs.length - 1].args : null;
 })()`);
 check("move-to applied (root.md -> home/root.md)", mvArgs && mvArgs.newPath === "home/root.md", JSON.stringify(mvArgs));
+
+// ---- 4b. rename dialog (note context menu): prefilled name,
+// Enter/click sends rename_note with the new path AND new title ----
+await evalJs(`document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }))`);
+const ctxRename = await evalJs(`(() => {
+  const b = document.querySelector('button.tree-item[title="root.md"]');
+  if (!b) return "no-note";
+  const r = b.getBoundingClientRect();
+  b.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: r.x + 10, clientY: r.y + 5 }));
+  return "ctx";
+})()`);
+await sleep(200);
+const menuHasRename = await evalJs(`Array.from(document.querySelectorAll(".ctx-menu .ctx-item")).map(b => b.textContent.trim())`);
+check("note menu has a Rename item", ctxRename === "ctx" && Array.isArray(menuHasRename) && menuHasRename.includes("Rename"), JSON.stringify(menuHasRename));
+const renameBtn = await evalJs(`(() => {
+  const b = Array.from(document.querySelectorAll(".ctx-menu .ctx-item")).find(x => x.textContent.trim() === "Rename");
+  b && b.click();
+  return !!b;
+})()`);
+await sleep(200);
+const dlgOpen = await evalJs(`(() => {
+  const d = document.querySelector(".dlg");
+  if (!d) return { open: false };
+  const input = d.querySelector("input");
+  return { open: true, title: d.querySelector(".dlg-title")?.textContent, value: input ? input.value : null };
+})()`);
+check("rename dialog opens with the note name prefilled",
+  renameBtn === true && dlgOpen.open && dlgOpen.title === "Rename note" && dlgOpen.value === "root",
+  `btn=${renameBtn} ${JSON.stringify(dlgOpen)}`);
+// type a new name (React controlled input) and confirm with the button
+const dlgTyped = await evalJs(`(() => {
+  const input = document.querySelector(".dlg input");
+  if (!input) return "no-input";
+  const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+  set.call(input, "brand-new");
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  const btn = Array.from(document.querySelectorAll(".dlg-actions button")).find(x => x.textContent.trim() === "Rename");
+  btn && btn.click();
+  return btn ? "clicked" : "no-btn";
+})()`);
+await sleep(500);
+const rnArgs = await evalJs(`(() => {
+  const rs = window.__invokeArgs.filter(a => a.cmd === "rename_note");
+  return rs.length ? rs[rs.length - 1].args : null;
+})()`);
+const dlgGone = await evalJs(`(() => !document.querySelector(".dlg"))()`);
+check("rename dialog sends new path + new title and closes",
+  dlgTyped === "clicked" && rnArgs && rnArgs.newPath === "brand-new.md" && rnArgs.newTitle === "brand-new" && dlgGone,
+  `typed=${dlgTyped} args=${JSON.stringify(rnArgs)} gone=${dlgGone}`);
+
+// ---- 4c. swipe a row right-to-left: rename/delete actions reveal
+// behind it (Apple Notes style); rename opens the dialog, delete
+// asks confirm and deletes ----
+const swipeRow = (title, id, endDx) => `(() => {
+  const b = document.querySelector('button.tree-item[title="${title}"]');
+  if (!b) return "no-note";
+  const r = b.getBoundingClientRect();
+  const x = r.x + r.width - 40, y = r.y + r.height / 2;
+  const mk = (cx) => new Touch({ identifier: ${id}, target: b, clientX: cx, clientY: y, pageX: cx, pageY: y });
+  b.dispatchEvent(new TouchEvent("touchstart", { bubbles: true, cancelable: true, touches: [mk(x)], targetTouches: [mk(x)], changedTouches: [mk(x)] }));
+  b.dispatchEvent(new TouchEvent("touchmove", { bubbles: true, cancelable: true, touches: [mk(x + ${endDx / 2})], targetTouches: [mk(x + ${endDx / 2})], changedTouches: [mk(x + ${endDx / 2})] }));
+  b.dispatchEvent(new TouchEvent("touchmove", { bubbles: true, cancelable: true, touches: [mk(x + ${endDx})], targetTouches: [mk(x + ${endDx})], changedTouches: [mk(x + ${endDx})] }));
+  b.dispatchEvent(new TouchEvent("touchend", { bubbles: true, cancelable: true, touches: [], targetTouches: [], changedTouches: [mk(x + ${endDx})] }));
+  return "swiped";
+})()`;
+const sw1 = await evalJs(swipeRow("home/recipe.md", 41, -110));
+await sleep(250);
+const swState = await evalJs(`(() => {
+  const ra = document.querySelector(".row-actions");
+  if (!ra) return { open: false };
+  const row = ra.parentElement.querySelector(".tree-item");
+  return {
+    open: true,
+    acts: Array.from(ra.querySelectorAll(".row-act")).map(b => b.title),
+    tx: row ? row.style.transform : null,
+  };
+})()`);
+check("row swipe reveals rename/delete actions",
+  sw1 === "swiped" && swState.open && swState.acts && swState.acts[0] === "Rename" && swState.acts[1] === "Delete" && swState.tx === "translateX(-144px)",
+  `sw=${sw1} ${JSON.stringify(swState)}`);
+// the rename action opens the rename dialog (and retracts the row)
+const swRename = await evalJs(`(() => {
+  const b = Array.from(document.querySelectorAll(".row-act")).find(x => x.title === "Rename");
+  b && b.click();
+  return !!b;
+})()`);
+await sleep(250);
+const swDlg = await evalJs(`(() => {
+  const d = document.querySelector(".dlg");
+  return { open: !!d, value: d ? (d.querySelector("input") ? d.querySelector("input").value : null) : null };
+})()`);
+check("swipe action: rename opens the rename dialog",
+  swRename === true && swDlg.open && swDlg.value === "recipe", JSON.stringify(swDlg));
+await evalJs(`(() => {
+  const b = Array.from(document.querySelectorAll(".dlg-actions button")).find(x => x.textContent.trim() === "Cancel");
+  b && b.click();
+  return true;
+})()`);
+await sleep(200);
+// the delete action opens an IN-APP confirm dialog (not window.confirm,
+// which is unreliable in the webview); confirming it deletes the note
+const sw2 = await evalJs(swipeRow("home/recipe.md", 42, -110));
+await sleep(250);
+const swDelBtn = await evalJs(`(() => {
+  const b = Array.from(document.querySelectorAll(".row-act")).find(x => x.title === "Delete");
+  b && b.click();
+  return !!b;
+})()`);
+await sleep(300);
+const swDelConfirm = await evalJs(`(() => {
+  const dlg = Array.from(document.querySelectorAll(".dlg-title")).find(t => /delete note/i.test(t.textContent));
+  const card = dlg && dlg.closest(".dlg");
+  const del = card && Array.from(card.querySelectorAll(".dlg-actions button")).find(b => /delete/i.test(b.textContent));
+  del && del.click();
+  return !!del;
+})()`);
+// the note being deleted is home/recipe.md; pull its uuid straight from the
+// mock list (single source of truth, no hand-typed id to mismatch on)
+const recipeUuid = await evalJs(`(() => {
+  const n = window.__mockNotesList.find(x => x.path === "home/recipe.md");
+  return n ? n.uuid : null;
+})()`);
+// the confirm's Delete is async: poll for the delete_note invoke (~2s max)
+let delArgs = null;
+for (let i = 0; i < 20; i++) {
+  delArgs = await evalJs(`(() => {
+    const rs = window.__invokeArgs.filter(a => a.cmd === "delete_note");
+    return rs.length ? rs[rs.length - 1].args : null;
+  })()`);
+  if (delArgs && delArgs.uuid === recipeUuid) break;
+  await sleep(100);
+}
+check("swipe action: delete opens in-app confirm, then deletes",
+  sw2 === "swiped" && swDelBtn === true && swDelConfirm === true && delArgs && delArgs.uuid === recipeUuid,
+  `sw2=${sw2} btn=${swDelBtn} confirm=${swDelConfirm} recipe=${recipeUuid} args=${JSON.stringify(delArgs)}`);
 
 // ---- 5. touch long-press on a note lifts it; release without move -> menu ----
 await evalJs(`document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }))`);
@@ -467,7 +652,8 @@ check("note dropped on its own folder -> vault root (recipe.md)", ownDrop === "d
 
 // ---- 6. edge swipes: close (left swipe in sidebar) then open (right swipe from left edge) ----
 const closed = await evalJs(`(() => {
-  const target = document.querySelector(".sidebar .tree-item") || document.querySelector(".sidebar input");
+  // NOT on a note row: rows have their own left-swipe (rename/delete)
+  const target = document.querySelector(".sidebar .side-top") || document.querySelector(".sidebar .tree-dir");
   if (!target) return "no sidebar target";
   const t1 = new Touch({ identifier: 2, target, clientX: 100, clientY: 300, pageX: 100, pageY: 300 });
   target.dispatchEvent(new TouchEvent("touchstart", { bubbles: true, cancelable: true, touches: [t1], targetTouches: [t1], changedTouches: [t1] }));

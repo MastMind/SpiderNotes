@@ -1,7 +1,7 @@
 :root {
   color-scheme: dark;
   /* base UI font size — fixed; the UI chrome always uses this */
-  --ui-fs: 14px;
+  --ui-fs: 15px;
   /* note text (editor content + gutter): size comes from the "Note font
      size" slider, family from the "Note font" select (mono | sans) */
   --note-fs: 14px;
@@ -423,6 +423,16 @@ button.danger {
   align-items: center;
 }
 
+/* The "New note" button (opens the create dialog, which also offers
+   encrypting the note). Fills the row like the old input + plus did. */
+.newnote .newnote-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+}
+
 .tree-wrap {
   flex: 1;
   overflow-y: auto;
@@ -451,7 +461,7 @@ button.danger {
     background: none;
     border: none;
     border-radius: 7px;
-    padding: 5px 8px;
+    padding: 7px 10px;
     color: var(--fg);
     font-size: calc(var(--ui-fs) - 1px);
     line-height: 1.3;
@@ -507,6 +517,14 @@ button.danger {
     cursor: pointer;
   }
 
+  /* Lock glyph before the title of an encrypted note */
+  .row-lock {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    color: var(--muted);
+  }
+
   /* Sync status footer at the bottom of the notes panel: mode icon +
      "mode · last sync" line + a manual-sync button. */
   .sync-foot {
@@ -540,6 +558,48 @@ button.danger {
     color: var(--fg);
   }
 
+/* swipe actions (Apple Notes style): the row slides left over an
+   opaque background to reveal rename/delete buttons behind it */
+.tree-li-note {
+  position: relative;
+  overflow: hidden;
+  border-radius: 7px;
+}
+.tree-li-note > .tree-item {
+  position: relative;
+  /* opaque so the action layer behind never shows through the row */
+  background: var(--bg2);
+}
+.tree-li-note > .tree-item:hover {
+  background: var(--bg3);
+}
+.tree-li-note > .tree-item.sel {
+  background: var(--accent2);
+}
+.row-actions {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+}
+.row-act {
+  width: 72px;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  background: var(--bg3);
+  color: var(--fg);
+}
+.row-act-danger {
+  background: var(--danger);
+  color: #201014;
+}
+
 .tree-host {
   position: relative;
 }
@@ -553,9 +613,11 @@ button.danger {
 .tree-dir {
   cursor: pointer;
   color: var(--fg);
-  font-size: calc(var(--ui-fs) - 2px);
+  /* folders were a full step smaller than note rows — brought to the
+     same size: they are the drag targets and must be easy to hit */
+  font-size: calc(var(--ui-fs) - 1px);
   font-weight: 600;
-  padding: 5px 8px;
+  padding: 7px 10px;
   user-select: none;
   -webkit-touch-callout: none;
   touch-action: manipulation;
@@ -623,7 +685,7 @@ details[open] > summary.tree-dir .dir-chev {
 }
 
 .tree-dir .dir-count {
-  font-size: 10px;
+  font-size: 11px;
   flex-shrink: 0;
 }
 
@@ -634,8 +696,8 @@ details[open] > summary.tree-dir .dir-chev {
 }
 
 .drop-hint {
-  padding: 3px 8px;
-  font-size: 11px;
+  padding: 5px 10px;
+  font-size: 12px;
   border-top: 1px dashed var(--border);
 }
 
@@ -809,6 +871,37 @@ details[open] > summary.tree-dir .dir-chev {
    min-width: 0;
  }
 
+.editor-wrap {
+    position: relative;
+    flex: 1;
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  /* insert-media button, floating over the editor's top-right corner */
+  .attach-btn {
+    position: absolute;
+    top: 6px;
+    right: 8px;
+    z-index: 20;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg) 80%, transparent);
+    color: var(--muted);
+    cursor: pointer;
+    padding: 0;
+  }
+  .attach-btn:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+
 .editor {
     flex: 1;
     min-width: 0;
@@ -879,6 +972,124 @@ details[open] > summary.tree-dir .dir-chev {
     text-decoration: underline;
     text-underline-offset: 2px;
     cursor: pointer;
+  }
+  /* GFM task-list checkbox (replaces the literal [ ] / [x]) */
+  .editor .md-checkbox {
+    display: inline-block;
+    width: 1.05em;
+    height: 1.05em;
+    margin: 0 5px 0 1px;
+    vertical-align: -0.18em;
+    border: 1.5px solid var(--muted);
+    border-radius: 3px;
+    cursor: pointer;
+    background: transparent;
+  }
+  .editor .md-checkbox.checked {
+    background: var(--accent);
+    border-color: var(--accent);
+    position: relative;
+  }
+  .editor .md-checkbox.checked::after {
+    content: "";
+    position: absolute;
+    left: 26%;
+    top: 12%;
+    width: 0.28em;
+    height: 0.55em;
+    border: solid #fff;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+  }
+  /* task rows: no bullet (the checkbox is the marker) */
+  .editor .cm-line.md-task::before {
+    content: none;
+  }
+  /* inline images and media (replace the whole ![...](...) syntax) */
+  .editor .md-img-wrap {
+    display: inline-block;
+    max-width: 100%;
+  }
+  .editor .md-img {
+    max-width: 100%;
+    max-height: 320px;
+    border-radius: 6px;
+    vertical-align: middle;
+  }
+  .editor .md-img-wrap.md-img-broken {
+    color: var(--muted);
+    border: 1px dashed var(--border);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 0.85em;
+  }
+  .editor .md-media-wrap {
+    display: inline-block;
+    max-width: 100%;
+  }
+  .editor .md-video {
+    max-width: 100%;
+    max-height: 320px;
+    border-radius: 6px;
+    vertical-align: middle;
+  }
+  .editor .md-audio {
+    height: 2.4em;
+    vertical-align: middle;
+  }
+  /* pdf: inline <embed> on WebKit (first page renders, scrollable),
+     a card (opens the system viewer) on Windows/Android */
+  .editor .md-pdf-wrap {
+    display: inline-block;
+    max-width: 100%;
+  }
+  .editor .md-pdf {
+    width: 100%;
+    max-width: 520px;
+    height: 380px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: #fff;
+    vertical-align: middle;
+  }
+  .editor .md-pdf-card {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 10px;
+    cursor: pointer;
+    font-size: 0.9em;
+    background: rgba(141, 134, 160, 0.08);
+    vertical-align: middle;
+  }
+  /* http(s) link: the whole [text](url) becomes a clickable preview chip */
+  .editor .md-link-card {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 2px 8px;
+    cursor: pointer;
+    font-size: 0.9em;
+    color: var(--accent);
+    vertical-align: middle;
+  }
+  .editor .md-link-ico {
+    display: inline-flex;
+    flex: none;
+  }
+  .editor .md-link-ico svg {
+    width: 13px;
+    height: 13px;
+  }
+  .editor .md-link-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .editor .md-wikilink {
     color: var(--accent);
@@ -1161,6 +1372,14 @@ details[open] > summary.tree-dir .dir-chev {
    flex-shrink: 0;
  }
 
+ .selfdev-name {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
  .selfdev {
     border-bottom: 1px solid var(--border);
   }
@@ -1339,6 +1558,17 @@ details[open] > summary.tree-dir .dir-chev {
     padding: 4px 6px;
     font-size: 12px;
   }
+  /* phones: taller note/folder rows — comfortable grab targets for taps
+     and for dragging notes into folders */
+  .tree-item {
+    min-height: 42px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+  .tree-dir {
+    min-height: 42px;
+  }
   /* the notes list is a full-screen overlay (covers the editor); it has
      its own close button and the swipe-left gesture still works. Instead
      of the desktop margin slide it glides off with a transform (the
@@ -1446,6 +1676,108 @@ details[open] > summary.tree-dir .dir-chev {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+/* queued vault change: shown until the app is relaunched */
+.pending-vault {
+  padding: 6px 12px;
+  background: color-mix(in srgb, var(--warn) 14%, var(--bg));
+  border-bottom: 1px solid var(--border);
+  color: var(--warn);
+  font-size: calc(var(--ui-fs) - 2px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* generic modal dialog (rename, create, unlock…) */
+.dlg-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 60;
+}
+
+.dlg {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--lift);
+  width: min(360px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-family: var(--font-sans);
+}
+
+.dlg-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.dlg-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dlg-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* "Encrypt this note" checkbox in the create dialog */
+.dlg-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: calc(var(--ui-fs) - 1px);
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+.dlg-check input {
+  margin: 0;
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+}
+
+/* The "no recovery key" warning under the password fields */
+.dlg-warn {
+  margin: 0;
+  color: var(--warn);
+  line-height: 1.4;
+}
+
+/* "Clean up unused assets" dialog: the orphan file list */
+.asset-list {
+  max-height: 200px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+}
+.asset-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.9em;
+}
+.asset-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .conflict-head h2 {

@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import * as api from "./api";
-import type { Backlink, Conflict, NoteSummary, OpenResult, PeerInfo, P2pSettings, TagCount } from "./types";
+import type { AssetReport, Backlink, Conflict, NoteSummary, OpenResult, PeerInfo, P2pSettings, TagCount } from "./types";
+import { formatBytes } from "./format";
+import { Dialog } from "./Dialog";
 import { Editor } from "./Editor";
+import { setMediaPort, setVaultRoot } from "./livePreview";
 import { NotesTree, formatWhen } from "./NotesTree";
 import { PeersPanel } from "./PeersPanel";
 import { THEMES } from "./themes";
@@ -53,7 +56,49 @@ export default function App() {
   const [log, setLog] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [newName, setNewName] = useState("");
+  // rename dialog: the note being renamed + the new name being typed
+  const [renamingUuid, setRenamingUuid] = useState<string | null>(null);
+  const [renameName, setRenameName] = useState("");
+  // a vault picked via "Change vault…" — opened on the NEXT launch
+  const [pendingVault, setPendingVault] = useState<string | null>(() =>
+    localStorage.getItem("sn.pendingVaultPath")
+  );
+  // New-note dialog: name, "encrypt" flag, and (when encrypting) the
+  // password typed twice. Replaces the old inline quick-create input.
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createName, setCreateName] = useState("");
+  const [createEncrypt, setCreateEncrypt] = useState(false);
+  const [createPass, setCreatePass] = useState("");
+  const [createPass2, setCreatePass2] = useState("");
+  // Unlock dialog: an encrypted note awaiting its password. `action` is
+  // what to do once unlocked (open it, or finish a pending move/delete).
+  const [unlockState, setUnlockState] = useState<{
+    uuid: string;
+    action: "open" | "move" | "delete";
+    moveDir?: string | null;
+  } | null>(null);
+  const [unlockPass, setUnlockPass] = useState("");
+  // Encrypted notes unlocked in THIS session (their key is held in the
+  // Rust app state); cleared on vault switch. Lets re-opening / moving /
+  // deleting skip the password prompt.
+  const unlockedRef = useRef<Set<string>>(new Set());
+  // The "really delete?" confirmation for a note OR a folder. An in-app
+  // dialog, NOT window.confirm: in the WKWebView the native confirm does not
+  // reliably block (it can return before the user answers), so a deletion
+  // could fire with no working prompt. State-driven, it is always shown and
+  // the delete happens only after its explicit answer. For an encrypted note
+  // the password dialog comes FIRST; this confirm is the second step.
+  const [delConfirm, setDelConfirm] = useState<{
+    kind: "note" | "folder";
+    id: string; // note uuid or folder path
+    label: string; // display path
+    noteCount?: number; // folders only
+  } | null>(null);
+  // Orphan-asset scan result for the settings "Storage" section. Refreshed
+  // after autosave (references change with the saved content), after a
+  // vault opens and after a note unlocks.
+  const [assetReport, setAssetReport] = useState<AssetReport | null>(null);
+  const [cleanOpen, setCleanOpen] = useState(false);
   const [searchResults, setSearchResults] = useState<NoteSummary[] | null>(null);
   const [tags, setTags] = useState<TagCount[]>([]);
   const [activeTag, setActiveTag] = useState<string | null>(null);
@@ -232,6 +277,16 @@ export default function App() {
     [conflictView, addLog, closeConflict, refresh],
   );
 
+  // Encrypted notes can't show their (ciphertext) content in the conflict
+  // panel, so it offers keep-mine / keep-theirs only.
+  const conflictEncrypted = useMemo(
+    () =>
+      conflictView
+        ? notes.some((n) => n.uuid === conflictView.note_uuid && n.encrypted)
+        : false,
+    [conflictView, notes],
+  );
+
   // Re-read the currently open note after a sync: the remote side may have
   // changed (or deleted) it, and the editor only follows the `doc` prop.
   const refreshOpenNote = useCallback(async () => {
@@ -268,16 +323,44 @@ export default function App() {
     let cancelled = false;
     (async () => {
       try {
-        const res = await api.vaultStatus();
+        let res = await api.vaultStatus();
+        // A vault change picked in the settings is applied at launch
+        // (in place of the last used path); otherwise the last vault
+        // opens automatically — the welcome screen is first-launch only.
+        const pending = localStorage.getItem("sn.pendingVaultPath");
+        if (!res) {
+          const last = pending || savedVaultPath();
+          if (last) {
+            res = await api.openVault(last);
+            if (pending) {
+              localStorage.setItem("sn.vaultPath", pending);
+              localStorage.removeItem("sn.pendingVaultPath");
+              setPendingVault(null);
+            }
+          }
+        }
         if (cancelled || !res) return;
+        // a fresh vault: no previously-unlocked notes survive (Rust drops
+        // its held keys too, in do_open_vault)
+        unlockedRef.current.clear();
         setOpen(res);
         setNotes(res.notes);
         setPeers(res.peers);
         setFolders(res.folders);
+        setVaultRoot(res.path);
+        setMediaPort(res.media_port);
         // populate the sync footer (p2p settings + relay state)
-        if (!cancelled) void refresh();
+        if (!cancelled) {
+          void refresh();
+          void refreshAssetReportRef.current();
+        }
       } catch {
-        // not in a Tauri context (plain browser) — stay on the welcome screen
+        // not in a Tauri context (plain browser), or the saved/pending
+        // path no longer opens — stay on the welcome screen
+        if (!cancelled) {
+          const p = localStorage.getItem("sn.pendingVaultPath");
+          if (p) setPathInput(p);
+        }
       }
     })();
     return () => {
@@ -306,6 +389,10 @@ export default function App() {
         if (a > 0) await api.setAutosyncSecs(a);
         const p = parseInt(localStorage.getItem("sn.p2pPort") || "", 10);
         if (p > 0) await api.setP2pPortSetting(p);
+        // media download is on unless the user disabled it
+        await api.setDownloadMedia(
+          localStorage.getItem("sn.downloadMedia") !== "0"
+        );
         // background sync (Android foreground service) is on unless disabled
         await api.setBgSync(localStorage.getItem("sn.bgSync") !== "0");
         // relay server: re-enable the stored room (backend state is
@@ -383,6 +470,7 @@ export default function App() {
       y: number;
       inSidebar: boolean;
       inText: boolean;
+      onNoteRow: boolean;
     } | null = null;
     const onStart = (e: TouchEvent) => {
       const t = e.touches[0];
@@ -399,6 +487,10 @@ export default function App() {
         // would make the list un-openable while a note is open (the editor
         // then covers the whole screen).
         inText: !!el?.closest?.("input, textarea, .panel"),
+        // note rows have their own right-to-left swipe (rename/delete
+        // actions) — a left swipe starting on a row must not close the
+        // list; close it from a folder row, the header or empty space
+        onNoteRow: !!el?.closest?.(".tree-li-note"),
       };
     };
     const onEnd = (e: TouchEvent) => {
@@ -413,6 +505,7 @@ export default function App() {
       if (
         dx < 0 &&
         s.inSidebar &&
+        !s.onNoteRow &&
         showSidebarRef.current &&
         !document.querySelector(".drag-ghost")
       ) {
@@ -509,24 +602,140 @@ export default function App() {
     };
   }, [selected]);
 
-  const selectNote = useCallback(
-    async (uuid: string) => {
+  // Load a note into the editor. For an ENCRYPTED note the Rust side returns
+  // the plaintext only while it is unlocked; a locked one must go through
+  // the password dialog (selectNote routes it there) before this is called.
+  const loadNoteContent = useCallback(async (uuid: string) => {
+    try {
+      const note = await api.readNote(uuid);
+      setSelected(uuid);
+      setDoc(note.content);
+      setDirty(false);
+      setError("");
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  // Drop the held key of the note currently open (encrypted only) so its
+  // plaintext does not linger in memory once the user moves on.
+  const lockSelectedIfEncrypted = useCallback(() => {
+    const cur = selectedRef.current;
+    if (!cur) return;
+    const n = notesRef.current.find((x) => x.uuid === cur);
+    if (n?.encrypted && unlockedRef.current.has(cur)) {
+      unlockedRef.current.delete(cur);
+      void api.lockNote(cur).catch(() => {});
+    }
+  }, []);
+
+  // Actual move / delete (no gate, no confirm): the entry points below and
+  // confirmUnlock both funnel here after any password has been collected.
+  const performMove = useCallback(
+    async (uuid: string, destDir: string | null) => {
+      const n = notesRef.current.find((x) => x.uuid === uuid);
+      if (!n) return;
+      const base = n.path.split("/").pop() ?? n.path;
+      const newDir = destDir ?? "";
+      const curDir = n.path.slice(0, n.path.length - base.length).replace(/\/$/, "");
+      if (newDir === curDir) return; // dropped where it already is
+      const newPath = newDir ? `${newDir}/${base}` : base;
       try {
-        const note = await api.readNote(uuid);
-        setSelected(uuid);
-        setDoc(note.content);
-        setDirty(false);
-        setError("");
+        await api.renameNote(uuid, newPath);
+        addLog(`moved: ${n.path} -> ${newPath}`);
+        await refresh();
       } catch (e) {
         setError(String(e));
       }
     },
-    [],
+    [addLog, refresh],
   );
 
+  // Scan for orphan assets (fire-and-forget). Coalesced: a scan in flight
+  // is skipped so rapid autosaves don't stack them up.
+  const assetScanBusy = useRef(false);
+  const refreshAssetReport = useCallback(async () => {
+    if (!open || assetScanBusy.current) return;
+    assetScanBusy.current = true;
+    try {
+      setAssetReport(await api.assetReport());
+    } catch {
+      // the vault may have been closed in the meantime — ignore
+    } finally {
+      assetScanBusy.current = false;
+    }
+  }, [open]);
+  const refreshAssetReportRef = useRef(refreshAssetReport);
+  refreshAssetReportRef.current = refreshAssetReport;
+
+  const performDelete = useCallback(
+    async (uuid: string) => {
+      const n = notesRef.current.find((x) => x.uuid === uuid);
+      if (!n) return;
+      try {
+        await api.deleteNote(uuid);
+        if (selectedRef.current === uuid) {
+          setSelected(null);
+          setDoc("");
+        }
+        addLog(`deleted: ${n.path}`);
+        await refresh();
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [addLog, refresh],
+  );
+
+  const performDeleteFolder = useCallback(
+    async (path: string) => {
+      try {
+        const deleted = await api.deleteFolder(path);
+        addLog(`folder deleted: ${path} (${deleted.length} notes)`);
+        // close the editor if the open note lived inside
+        const sel = selectedRef.current;
+        if (sel && deleted.some((d) => d.uuid === sel)) {
+          setSelected(null);
+          setDoc("");
+        }
+        await refresh();
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [addLog, refresh],
+  );
+
+  // The in-app "really delete?" dialog (note or folder) was answered.
+  const confirmDel = useCallback(() => {
+    const dc = delConfirm;
+    if (!dc) return;
+    setDelConfirm(null);
+    if (dc.kind === "note") {
+      // the note (if encrypted) was unlocked to allow this and is about to be
+      // deleted: drop it from the session set (Rust drops the key in delete_note)
+      unlockedRef.current.delete(dc.id);
+      void performDelete(dc.id);
+    } else {
+      void performDeleteFolder(dc.id);
+    }
+  }, [delConfirm, performDelete, performDeleteFolder]);
+
+  const cancelDel = useCallback(() => {
+    const dc = delConfirm;
+    if (!dc) return;
+    setDelConfirm(null);
+    if (dc.kind === "note") {
+      // canceled: if we unlocked the note to reach the dialog, lock it again
+      // (a no-op for a plain note) so the key does not linger
+      void api.lockNote(dc.id).catch(() => {});
+      unlockedRef.current.delete(dc.id);
+    }
+  }, [delConfirm]);
+
   // Immediate (non-debounced) save of the open document. Runs from the
-  // autosave timer and from the hide/exit hooks below, so pending keystrokes
-  // are never lost when the window goes away.
+  // autosave timer, from the hide/exit hooks and from closing the open note,
+  // so pending keystrokes are never lost.
   const flushSave = useCallback(async () => {
     if (saveTimer.current) {
       window.clearTimeout(saveTimer.current);
@@ -542,11 +751,103 @@ export default function App() {
       setDirty(false);
       addLog(`saved: ${n.path}`);
       void refresh();
+      // a saved note may have gained/lost asset references — rescan
+      void refreshAssetReport();
     } catch (e) {
       setError(String(e));
       addLog(`save failed: ${n.path}`);
     }
-  }, [addLog, refresh]);
+  }, [addLog, refresh, refreshAssetReport]);
+
+  const selectNote = useCallback(
+    async (uuid: string) => {
+      if (uuid === selectedRef.current) {
+        // tapping the open note again closes it (deselect). The notes list
+        // stays open — the user is mid-browse and may open another note.
+        void flushSave();
+        lockSelectedIfEncrypted();
+        setSelected(null);
+        setDoc("");
+        setDirty(false);
+        return;
+      }
+      const n = notesRef.current.find((x) => x.uuid === uuid);
+      if (!n) return;
+      if (n.encrypted && !unlockedRef.current.has(uuid)) {
+        // ask for the password first, then open (confirmUnlock continues)
+        setUnlockPass("");
+        setUnlockState({ uuid, action: "open" });
+        return;
+      }
+      lockSelectedIfEncrypted();
+      await loadNoteContent(uuid);
+    },
+    [
+      loadNoteContent,
+      lockSelectedIfEncrypted,
+      flushSave,
+    ],
+  );
+
+  // The unlock dialog submitted: verify the password, then do the pending
+  // action (open the note, or finish the move/delete that triggered it).
+  const confirmUnlock = useCallback(async () => {
+    const st = unlockState;
+    if (!st) return;
+    try {
+      await api.unlockNote(st.uuid, unlockPass);
+      unlockedRef.current.add(st.uuid);
+      setUnlockState(null);
+      setUnlockPass("");
+      // the note's references are readable now — the orphan set shrinks
+      void refreshAssetReport();
+      if (st.action === "open") {
+        lockSelectedIfEncrypted();
+        await loadNoteContent(st.uuid);
+      } else if (st.action === "move") {
+        void performMove(st.uuid, st.moveDir ?? null);
+      } else {
+        // delete: the confirmation comes AFTER the password, as an in-app
+        // dialog (window.confirm is unreliable in the webview). The note
+        // stays unlocked while the dialog is open; confirmDel/cancelDel
+        // decide the outcome.
+        const n = notesRef.current.find((x) => x.uuid === st.uuid);
+        if (n) {
+          setDelConfirm({ kind: "note", id: st.uuid, label: n.path });
+        } else {
+          // the note vanished meanwhile: drop the key we just derived
+          void api.lockNote(st.uuid).catch(() => {});
+          unlockedRef.current.delete(st.uuid);
+        }
+      }
+    } catch (e) {
+      setError(String(e)); // wrong password (or unreadable note)
+    }
+  }, [
+    unlockState,
+    unlockPass,
+    loadNoteContent,
+    lockSelectedIfEncrypted,
+    performMove,
+    refreshAssetReport,
+  ]);
+
+  // "Clean up unused assets" dialog: delete exactly the listed orphans.
+  const confirmClean = useCallback(async () => {
+    const r = assetReport;
+    if (!r || !r.orphans.length) return;
+    try {
+      const freed = await api.deleteAssets(r.orphans);
+      setCleanOpen(false);
+      addLog(
+        `assets cleaned: ${r.orphans.length} file${r.orphans.length > 1 ? "s" : ""} (${formatBytes(freed)} freed)`,
+      );
+      await refreshAssetReport();
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [assetReport, addLog, refreshAssetReport]);
+
 
   const scheduleSave = useCallback(() => {
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
@@ -644,12 +945,19 @@ export default function App() {
     try {
       const res = await api.openVault(pathInput);
       localStorage.setItem("sn.vaultPath", pathInput);
+      localStorage.removeItem("sn.pendingVaultPath");
+      setPendingVault(null);
+      // a fresh vault: no previously-unlocked notes survive
+      unlockedRef.current.clear();
       setOpen(res);
       setNotes(res.notes);
       setPeers(res.peers);
       setFolders(res.folders);
+      setVaultRoot(res.path);
+      setMediaPort(res.media_port);
       // populate the sync footer (p2p settings + relay state)
       void refresh();
+      void refreshAssetReport();
       addLog(
         `vault opened: ${res.path} (P2P port ${res.p2p_port}, device ${res.device_name})`,
       );
@@ -658,55 +966,103 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [pathInput, addLog]);
+  }, [pathInput, addLog, refreshAssetReport]);
 
-  const createNote = useCallback(async () => {
-    const name = newName.trim();
+  // native folder picker -> fills the welcome screen's path field
+  const pickVault = useCallback(async () => {
+    try {
+      const d = await api.pickDirectory();
+      if (d) {
+        setPathInput(d);
+        setError("");
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  // native folder picker -> queues a new vault for the NEXT launch
+  const changeVault = useCallback(async () => {
+    try {
+      const d = await api.pickDirectory();
+      if (!d) return;
+      localStorage.setItem("sn.pendingVaultPath", d);
+      setPendingVault(d);
+      addLog(`vault change queued: ${d} (applies on next launch)`);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [addLog]);
+
+  // Create a note from the new-note dialog. Plain notes go through the normal
+  // save path; encrypted notes derive their key from the password (verified
+  // in Rust) and are created already unlocked so the editor shows plaintext.
+  const confirmCreate = useCallback(async () => {
+    const name = createName.trim();
     if (!name) return;
     const path = name.endsWith(".md") ? name : `${name}.md`;
+    // mirror the Create button's disabled condition — Enter in a field calls
+    // this directly and would otherwise bypass it (e.g. an EMPTY password,
+    // where the two fields "match" and a note is created with none)
+    if (createEncrypt && createPass.length < 1) {
+      setError("Enter a password");
+      return;
+    }
+    if (createEncrypt && createPass !== createPass2) {
+      setError("Passwords do not match");
+      return;
+    }
     try {
-      await api.saveNote(path, `# ${path.replace(/\.md$/, "")}\n`);
-      setNewName("");
+      if (createEncrypt) {
+        // the note is created already unlocked (Rust holds its key)
+        const created = await api.createEncryptedNote(path, createPass);
+        unlockedRef.current.add(created.uuid);
+      } else {
+        await api.saveNote(path, `# ${path.replace(/\.md$/, "")}\n`);
+      }
+      setCreateOpen(false);
+      setCreateName("");
+      setCreateEncrypt(false);
+      setCreatePass("");
+      setCreatePass2("");
       await refresh();
       const n = notesRef.current.find((x) => x.path === path);
       if (n) void selectNote(n.uuid);
     } catch (e) {
       setError(String(e));
     }
-  }, [newName, refresh, selectNote]);
+  }, [createName, createEncrypt, createPass, createPass2, refresh, selectNote]);
 
-  const doDelete = useCallback(async () => {
-    const uuid = selectedRef.current;
-    if (!uuid) return;
+   // opens the rename dialog (the name field is prefilled with the note's
+  // basename; the folder stays where it is — moving is the "Move to…" item)
+  const doRenameNote = useCallback((uuid: string) => {
     const n = notesRef.current.find((x) => x.uuid === uuid);
     if (!n) return;
-    if (!window.confirm(`Delete ${n.path}?`)) return;
+    setRenameName(n.path.replace(/\.md$/, "").split("/").pop() || n.path);
+    setRenamingUuid(uuid);
+  }, []);
+
+  const confirmRename = useCallback(async () => {
+    const uuid = renamingUuid;
+    if (!uuid) return;
+    const n = notesRef.current.find((x) => x.uuid === uuid);
+    const name = renameName.trim().replace(/\.md$/, "");
+    setRenamingUuid(null);
+    if (!n || !name) return;
+    const base = n.path.split("/").pop() || n.path;
+    if (name + ".md" === base) return;
+    const parent = n.path.includes("/")
+      ? n.path.slice(0, n.path.lastIndexOf("/") + 1)
+      : "";
+    const newPath = parent + name + ".md";
     try {
-      await api.deleteNote(uuid);
-      setSelected(null);
-      setDoc("");
-      addLog(`deleted: ${n.path}`);
+      await api.renameNote(uuid, newPath, name);
+      addLog(`renamed: ${n.path} -> ${newPath}`);
       await refresh();
     } catch (e) {
       setError(String(e));
     }
-  }, [addLog, refresh]);
-
-  const doRename = useCallback(async () => {
-    const uuid = selectedRef.current;
-    if (!uuid) return;
-    const n = notesRef.current.find((x) => x.uuid === uuid);
-    if (!n) return;
-    const np = window.prompt("New path (relative to the vault):", n.path);
-    if (!np || np === n.path) return;
-    try {
-      await api.renameNote(uuid, np);
-      addLog(`renamed: ${n.path} -> ${np}`);
-      await refresh();
-    } catch (e) {
-      setError(String(e));
-    }
-  }, [addLog, refresh]);
+  }, [renamingUuid, renameName, addLog, refresh]);
 
   const doCreateFolder = useCallback(
     async (parentDir: string) => {
@@ -751,30 +1107,10 @@ export default function App() {
       const count = notesRef.current.filter((n) =>
         n.path.startsWith(`${path}/`),
       ).length;
-      if (
-        !window.confirm(
-          `Delete folder "${path}"${count ? ` and its ${count} note(s)` : ""}?`,
-        )
-      )
-        return;
-      try {
-        const deleted = await api.deleteFolder(path);
-        addLog(`folder deleted: ${path} (${deleted.length} notes)`);
-        // close the editor if the open note lived inside
-        const sel = selectedRef.current;
-        if (
-          sel &&
-          deleted.some((d) => d.uuid === sel)
-        ) {
-          setSelected(null);
-          setDoc("");
-        }
-        await refresh();
-      } catch (e) {
-        setError(String(e));
-      }
+      // in-app confirm (window.confirm is unreliable in the webview)
+      setDelConfirm({ kind: "folder", id: path, label: path, noteCount: count });
     },
-    [addLog, refresh],
+    [],
   );
 
   const doMoveFolder = useCallback(
@@ -801,36 +1137,33 @@ export default function App() {
       const newDir = destDir ?? "";
       const curDir = n.path.slice(0, n.path.length - base.length).replace(/\/$/, "");
       if (newDir === curDir) return; // dropped where it already is
-      const newPath = newDir ? `${newDir}/${base}` : base;
-      try {
-        await api.renameNote(uuid, newPath);
-        addLog(`moved: ${n.path} -> ${newPath}`);
-        await refresh();
-      } catch (e) {
-        setError(String(e));
+      // encrypted notes: collect the password first, then move
+      if (n.encrypted && !unlockedRef.current.has(uuid)) {
+        setUnlockPass("");
+        setUnlockState({ uuid, action: "move", moveDir: destDir });
+        return;
       }
+      void performMove(uuid, destDir);
     },
-    [addLog, refresh],
+    [performMove],
   );
 
   const doDeleteNoteByUuid = useCallback(
     async (uuid: string) => {
       const n = notesRef.current.find((x) => x.uuid === uuid);
       if (!n) return;
-      if (!window.confirm(`Delete ${n.path}?`)) return;
-      try {
-        await api.deleteNote(uuid);
-        if (selectedRef.current === uuid) {
-          setSelected(null);
-          setDoc("");
-        }
-        addLog(`deleted: ${n.path}`);
-        await refresh();
-      } catch (e) {
-        setError(String(e));
+      // Encrypted and locked: ask for the password FIRST, the "really
+      // delete?" confirmation comes after the unlock (confirmUnlock) —
+      // the reverse order confused users.
+      if (n.encrypted && !unlockedRef.current.has(uuid)) {
+        setUnlockPass("");
+        setUnlockState({ uuid, action: "delete" });
+        return;
       }
+      // already unlocked (or not encrypted): straight to the in-app confirm
+      setDelConfirm({ kind: "note", id: uuid, label: n.path });
     },
-    [addLog, refresh],
+    [],
   );
 
   const doSync = useCallback(
@@ -839,7 +1172,7 @@ export default function App() {
       try {
         const r = await api.syncWith(peer);
         addLog(
-          `P2P ${r.peer_name}: sent ${r.sent}, applied ${r.applied}, skipped ${r.skipped}`,
+          `P2P ${r.peer_name}: sent ${r.sent}, applied ${r.applied}, skipped ${r.skipped}${r.assets ? `, media ${r.assets}` : ""}`,
         );
       } catch (e) {
         addLog(`P2P ${peer.name}: ${e}`);
@@ -865,7 +1198,7 @@ export default function App() {
       }
       for (const r of rs) {
         addLog(
-          `P2P ${r.peer_name}: sent ${r.sent}, applied ${r.applied}, skipped ${r.skipped}`,
+          `P2P ${r.peer_name}: sent ${r.sent}, applied ${r.applied}, skipped ${r.skipped}${r.assets ? `, media ${r.assets}` : ""}`,
         );
       }
     } catch (e) {
@@ -892,6 +1225,9 @@ export default function App() {
             onChange={(e) => setPathInput(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && openVault()}
           />
+          <button disabled={busy} onClick={pickVault}>
+            Choose folder…
+          </button>
           <button disabled={busy} onClick={openVault}>
             Open / create vault
           </button>
@@ -917,6 +1253,15 @@ export default function App() {
           </span>
         </div>
       </header>
+
+      {pendingVault && (
+        <div
+          className="pending-vault"
+          title="This vault will be opened on the next launch"
+        >
+          Vault change: {pendingVault} — applied on next launch
+        </div>
+      )}
 
       <div className="body">
         {/* Always mounted: the .open class drives the slide-in/out
@@ -956,16 +1301,8 @@ export default function App() {
             </div>
             <button
               className="icon-btn"
-              title={
-                selected
-                  ? "Close the selected note"
-                  : "No note selected"
-              }
-              disabled={!selected}
-              onClick={() => {
-                setSelected(null);
-                setDoc("");
-              }}
+              title="Hide notes list"
+              onClick={() => setShowSidebar(false)}
             >
               <CloseIcon />
             </button>
@@ -996,20 +1333,18 @@ export default function App() {
             </div>
           )}
           <div className="pad newnote">
-            <input
-              className="inp"
-              placeholder="note name"
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && createNote()}
-            />
             <button
-              className="icon-btn"
-              title="Create note"
-              onClick={createNote}
-              disabled={!newName.trim()}
+              className="wide newnote-btn"
+              title="New note"
+              onClick={() => {
+                setCreateName("");
+                setCreateEncrypt(false);
+                setCreatePass("");
+                setCreatePass2("");
+                setCreateOpen(true);
+              }}
             >
-              <PlusIcon />
+              <PlusIcon /> New note
             </button>
           </div>
           <div className="tree-wrap">
@@ -1030,6 +1365,7 @@ export default function App() {
               onDeleteFolder={doDeleteFolder}
                onMoveNote={(uuid, dir) => void doMoveNote(uuid, dir)}
                  onDeleteNote={(uuid) => void doDeleteNoteByUuid(uuid)}
+                 onRenameNote={doRenameNote}
                  onMoveFolder={(path, dir) => void doMoveFolder(path, dir)}
                  deviceNames={deviceNames}
                  conflictCount={conflictCount}
@@ -1047,14 +1383,7 @@ export default function App() {
               </button>
             )}
           </div>
-          {selected && (
-            <div className="pad note-actions">
-              <button className="danger" onClick={doDelete}>
-                Delete
-              </button>
-              <button onClick={doRename}>Rename</button>
-            </div>
-          )}
+ 
           {selected && backlinks.length > 0 && (
             <div className="backlinks">
               <h3>Backlinks ({backlinks.length})</h3>
@@ -1142,6 +1471,7 @@ export default function App() {
                 lineNumbers={lineNumbers}
                 onOpenNote={openWikiTarget}
                 onOpenTag={openTag}
+                onMediaError={setError}
               />
             </div>
           ) : (
@@ -1170,6 +1500,12 @@ export default function App() {
             onAutosaveSecs={setAutosaveSecs}
             buildSha={__BUILD_SHA__.slice(0, 7)}
             vaultPath={open.path}
+            assetReport={assetReport}
+            onCleanAssets={() => setCleanOpen(true)}
+            onChangeVault={() => void changeVault()}
+            onDeviceRenamed={(name) =>
+              setOpen((o) => (o ? { ...o, device_name: name } : o))
+            }
             onLog={addLog}
             log={log}
             theme={theme}
@@ -1209,37 +1545,311 @@ export default function App() {
                 {conflictView.note_path} — {conflictView.peer_name} ·{" "}
                 {formatWhen(conflictView.created_ms)}
               </div>
-              <p className="muted small conflict-hint">
-                Both devices edited this note in ways that cannot be combined
-                automatically. Pick the version to keep — nothing is lost
-                until you decide.
-              </p>
-              <div className="conflict-version">
-                <div className="conflict-chip">This device</div>
-                <pre className="conflict-pre">
-                  {conflictParts ? conflictParts.ours : "loading…"}
-                </pre>
-                <button
-                  disabled={!conflictParts}
-                  onClick={() => void doResolveConflict(false)}
-                >
-                  Keep this version
-                </button>
-              </div>
-              <div className="conflict-version">
-                <div className="conflict-chip">{conflictView.peer_name}</div>
-                <pre className="conflict-pre">
-                  {conflictParts ? conflictParts.theirs : "loading…"}
-                </pre>
-                <button
-                  disabled={!conflictParts}
-                  onClick={() => void doResolveConflict(true)}
-                >
-                  Keep this version
-                </button>
-              </div>
+             {conflictEncrypted ? (
+                <>
+                  <p className="muted small conflict-hint">
+                    Both devices edited this note. It is encrypted, so the
+                    two versions cannot be compared or combined here — pick
+                    which one to keep. The other is discarded.
+                  </p>
+                  <div className="conflict-version">
+                    <div className="conflict-chip">This device</div>
+                    <button
+                      onClick={() => void doResolveConflict(false)}
+                    >
+                      Keep this version
+                    </button>
+                  </div>
+                  <div className="conflict-version">
+                    <div className="conflict-chip">{conflictView.peer_name}</div>
+                    <button
+                      onClick={() => void doResolveConflict(true)}
+                    >
+                      Keep this version
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p className="muted small conflict-hint">
+                    Both devices edited this note in ways that cannot be
+                    combined automatically. Pick the version to keep — nothing
+                    is lost until you decide.
+                  </p>
+                  <div className="conflict-version">
+                    <div className="conflict-chip">This device</div>
+                    <pre className="conflict-pre">
+                      {conflictParts ? conflictParts.ours : "loading…"}
+                    </pre>
+                    <button
+                      disabled={!conflictParts}
+                      onClick={() => void doResolveConflict(false)}
+                    >
+                      Keep this version
+                    </button>
+                  </div>
+                  <div className="conflict-version">
+                    <div className="conflict-chip">{conflictView.peer_name}</div>
+                    <pre className="conflict-pre">
+                      {conflictParts ? conflictParts.theirs : "loading…"}
+                    </pre>
+                    <button
+                      disabled={!conflictParts}
+                      onClick={() => void doResolveConflict(true)}
+                    >
+                      Keep this version
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           </div>
+        )}
+
+        {renamingUuid &&
+          (() => {
+            const n = notesRef.current.find((x) => x.uuid === renamingUuid);
+            if (!n) return null;
+            const name = renameName.trim().replace(/\.md$/, "");
+            const parent = n.path.includes("/")
+              ? n.path.slice(0, n.path.lastIndexOf("/") + 1)
+              : "";
+            return (
+              <Dialog
+                title="Rename note"
+                onClose={() => setRenamingUuid(null)}
+                actions={
+                  <>
+                    <button onClick={() => setRenamingUuid(null)}>
+                      Cancel
+                    </button>
+                    <button
+                      disabled={
+                        !name ||
+                        name + ".md" === (n.path.split("/").pop() || "")
+                      }
+                      onClick={() => void confirmRename()}
+                    >
+                      Rename
+                    </button>
+                  </>
+                }
+              >
+                <div className="muted small">
+                  {parent
+                    ? `in folder: ${parent.slice(0, -1)}`
+                    : "in the vault root"}
+                </div>
+                <input
+                  className="inp"
+                  value={renameName}
+                  onChange={(e) => setRenameName(e.target.value)}
+                  onKeyDown={(e) =>
+                    e.key === "Enter" && name && void confirmRename()
+                  }
+                  placeholder="note name"
+             />
+              {name && (
+                    <div className="muted small">
+                      new path: {parent}
+                      {name}.md
+                    </div>
+                )}
+              </Dialog>
+            );
+          })()}
+
+        {createOpen && (
+          <Dialog
+            title="New note"
+            onClose={() => setCreateOpen(false)}
+            actions={
+              <>
+                <button onClick={() => setCreateOpen(false)}>Cancel</button>
+                <button
+                  disabled={
+                    !createName.trim() ||
+                    (createEncrypt &&
+                      (createPass.length < 1 || createPass !== createPass2))
+                  }
+                  onClick={() => void confirmCreate()}
+                >
+                  Create
+                </button>
+              </>
+            }
+          >
+            <input
+              className="inp"
+              value={createName}
+              onChange={(e) => setCreateName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && void confirmCreate()}
+              placeholder="note name"
+            />
+            <label className="dlg-check">
+              <input
+                type="checkbox"
+                checked={createEncrypt}
+                onChange={(e) => setCreateEncrypt(e.target.checked)}
+              />
+              Encrypt this note
+            </label>
+            {createEncrypt && (
+              <>
+                <input
+                  className="inp"
+                  type="password"
+                  value={createPass}
+                  onChange={(e) => setCreatePass(e.target.value)}
+                  placeholder="password"
+                />
+                <input
+                  className="inp"
+                  type="password"
+                  value={createPass2}
+                  onChange={(e) => setCreatePass2(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && void confirmCreate()}
+                  placeholder="repeat password"
+                />
+                <p className="muted small dlg-warn">
+                  The note is encrypted with this password. There is no
+                  recovery key — if you lose the password, the note is lost.
+                </p>
+              </>
+            )}
+          </Dialog>
+        )}
+
+        {unlockState && (
+          (() => {
+            const n = notesRef.current.find((x) => x.uuid === unlockState.uuid);
+            if (!n) return null;
+            return (
+              <Dialog
+                title={`Unlock "${n.path}"`}
+                onClose={() => setUnlockState(null)}
+                actions={
+                  <>
+                    <button onClick={() => setUnlockState(null)}>
+                      Cancel
+                    </button>
+                    <button
+                      disabled={unlockPass.length < 1}
+                      onClick={() => void confirmUnlock()}
+                    >
+                      Unlock
+                    </button>
+                  </>
+                }
+              >
+                <p className="muted small">
+                  This note is encrypted. Enter its password to{" "}
+                  {unlockState.action === "open"
+                    ? "open it"
+                    : unlockState.action === "move"
+                      ? "move it"
+                      : "delete it"}
+                  .
+                </p>
+                <input
+                  className="inp"
+                  type="password"
+                  value={unlockPass}
+                  onChange={(e) => setUnlockPass(e.target.value)}
+                  onKeyDown={(e) =>
+                    e.key === "Enter" && void confirmUnlock()
+                  }
+                  placeholder="password"
+                />
+              </Dialog>
+            );
+          })()
+        )}
+
+        {delConfirm && (
+          <Dialog
+            title={delConfirm.kind === "folder" ? "Delete folder" : "Delete note"}
+            onClose={cancelDel}
+            actions={
+              <>
+                <button onClick={cancelDel}>Cancel</button>
+                <button onClick={() => void confirmDel()}>Delete</button>
+              </>
+            }
+          >
+            <p className="muted small">
+              {delConfirm.kind === "folder" ? (
+                <>
+                  Delete folder <b>{delConfirm.label}</b>
+                  {delConfirm.noteCount ? (
+                    <>
+                      {" "}
+                      and its {delConfirm.noteCount} note
+                      {delConfirm.noteCount > 1 ? "s" : ""}
+                    </>
+                  ) : null}
+                  ? This cannot be undone.
+                </>
+              ) : (
+                <>
+                  Delete <b>{delConfirm.label}</b>? This cannot be undone.
+                </>
+              )}
+            </p>
+          </Dialog>
+        )}
+
+        {cleanOpen && assetReport && (
+          <Dialog
+            title="Clean up unused assets"
+            onClose={() => setCleanOpen(false)}
+            actions={
+              <>
+                <button onClick={() => setCleanOpen(false)}>
+                  Cancel
+                </button>
+                <button
+                  disabled={assetReport.orphans.length === 0}
+                  onClick={() => void confirmClean()}
+                >
+                  Delete {assetReport.orphans.length} (
+                  {formatBytes(assetReport.orphan_bytes)})
+                </button>
+              </>
+            }
+          >
+            {assetReport.orphans.length === 0 ? (
+              <p className="muted small">
+                Every asset is referenced by a note — nothing to clean up.
+              </p>
+            ) : (
+              <>
+                <div className="asset-list">
+                  {assetReport.orphans.map((p) => (
+                    <div className="asset-row" key={p}>
+                      <span className="asset-name" title={p}>
+                        {p.replace(/^\.?assets\//, "")}
+                      </span>
+                      <span className="muted small">
+                        {formatBytes(
+                          assetReport.files.find((f) => f.path === p)
+                            ?.size ?? 0,
+                        )}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                {assetReport.encrypted_unchecked > 0 && (
+                  <p className="muted small dlg-warn">
+                    {assetReport.encrypted_unchecked} locked encrypted note
+                    {assetReport.encrypted_unchecked > 1 ? "s" : ""} could not
+                    be checked — an asset used only inside one of them would
+                    be deleted. Unlock it and rescan if in doubt.
+                  </p>
+                )}
+              </>
+            )}
+          </Dialog>
         )}
       </div>
     </div>

@@ -143,3 +143,43 @@ export function NoteIcon({ size = 42, className }: IconProps) {
     </svg>
   );
 }
+
+// Pencil (feather "edit-2") for the swipe-to-rename action.
+export function PencilIcon({ size = 16, className }: IconProps) {
+  return (
+    <svg {...svgProps(size)} className={className}>
+      <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+    </svg>
+  );
+}
+
+// Trash (feather "trash-2") for the swipe-to-delete action.
+export function TrashIcon({ size = 16, className }: IconProps) {
+  return (
+    <svg {...svgProps(size)} className={className}>
+      <path d="M3 6h18" />
+      <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+      <path d="M10 11v6M14 11v6" />
+    </svg>
+  );
+}
+
+// Paperclip (feather "paperclip") for the editor's insert-media button.
+export function PaperclipIcon({ size = 15, className }: IconProps) {
+  return (
+    <svg {...svgProps(size)} className={className}>
+      <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+    </svg>
+  );
+}
+
+// Padlock (feather "lock") marking an encrypted note in the list.
+export function LockIcon({ size = 12, className }: IconProps) {
+  return (
+    <svg {...svgProps(size)} className={className}>
+      <rect x="4" y="11" width="16" height="10" rx="2" />
+      <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+    </svg>
+  );
+}

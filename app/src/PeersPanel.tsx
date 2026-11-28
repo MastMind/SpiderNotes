@@ -1,13 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import * as api from "./api";
-import type { PeerInfo, TrustedDevice } from "./types";
+import type { AssetReport, PeerInfo, TrustedDevice } from "./types";
+import { formatBytes } from "./format";
 import { THEMES } from "./themes";
-import { CheckIcon, CloseIcon } from "./icons";
+import { CheckIcon, CloseIcon, PencilIcon } from "./icons";
+import { Dialog } from "./Dialog";
 
 // Background sync (the Android foreground service) only exists on Android;
 // hide its toggle everywhere else. Tauri's Android webview is Chromium, so
 // its user agent carries "Android"; desktop webviews never do.
 const IS_ANDROID = /android/i.test(navigator.userAgent);
+
+// Release stage shown next to the version (alpha until we cut a beta).
+const PRE_RELEASE = "alpha";
 
 function shortId(id: string): string {
   if (id.length <= 16) return id;
@@ -98,6 +103,14 @@ export function PeersPanel(props: {
   onAutosaveSecs: (n: number) => void;
   buildSha: string;
   vaultPath: string;
+  /** Orphan-asset scan result (null until the first scan finishes). */
+  assetReport: AssetReport | null;
+  /** Open the "Clean up unused assets" dialog. */
+  onCleanAssets?: () => void;
+  /** Queue a different vault folder (applied on the next launch). */
+  onChangeVault?: () => void;
+  /** The device was renamed — update the device name shown everywhere. */
+  onDeviceRenamed?: (name: string) => void;
   onLog?: (m: string) => void;
   log: string[];
   theme: string;
@@ -113,6 +126,73 @@ export function PeersPanel(props: {
   onClose?: () => void;
 }) {
   const logRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLElement>(null);
+  // Close the panel by swiping RIGHT on it (besides the X): the panel
+  // follows the finger, closing past the threshold and snapping back
+  // otherwise. Activates only once horizontal intent is clear, so
+  // vertical scrolling of the panel is untouched.
+  useEffect(() => {
+    const el = panelRef.current;
+    const close = props.onClose;
+    if (!el || !close) return;
+    let sx = 0;
+    let sy = 0;
+    let tracking = false;
+    let horizontal = false;
+    const onStart = (e: TouchEvent) => {
+      const t = e.touches[0];
+      if (!t) return;
+      sx = t.clientX;
+      sy = t.clientY;
+      tracking = true;
+      horizontal = false;
+    };
+    const onMove = (e: TouchEvent) => {
+      if (!tracking) return;
+      const t = e.touches[0];
+      if (!t) return;
+      const dx = t.clientX - sx;
+      const dy = t.clientY - sy;
+      if (!horizontal) {
+        // vertical scroll or a leftward drag is not ours to handle
+        if (dx <= 0 || Math.abs(dx) < 10 || Math.abs(dx) <= Math.abs(dy))
+          return;
+        horizontal = true;
+        el.style.transition = "none";
+      }
+      el.style.transform = `translateX(${Math.min(dx, 320)}px)`;
+    };
+    const onEnd = (e: TouchEvent) => {
+      if (!tracking) return;
+      tracking = false;
+      const t = e.changedTouches[0];
+      const dx = t ? t.clientX - sx : 0;
+      el.style.transition = "transform 150ms ease-out";
+      if (horizontal && dx > 80) {
+        el.style.transform = "translateX(100%)";
+        window.setTimeout(() => {
+          el.style.transform = "";
+          el.style.transition = "";
+          close();
+        }, 150);
+      } else {
+        el.style.transform = "";
+        window.setTimeout(() => {
+          el.style.transition = "";
+        }, 150);
+      }
+    };
+    el.addEventListener("touchstart", onStart, { passive: true });
+    el.addEventListener("touchmove", onMove, { passive: true });
+    el.addEventListener("touchend", onEnd);
+    el.addEventListener("touchcancel", onEnd);
+    return () => {
+      el.removeEventListener("touchstart", onStart);
+      el.removeEventListener("touchmove", onMove);
+      el.removeEventListener("touchend", onEnd);
+      el.removeEventListener("touchcancel", onEnd);
+    };
+  }, [props.onClose]);
   // comparison codes for my device + every listed peer
   const codes = useCodes([
     props.deviceId,
@@ -124,7 +204,42 @@ export function PeersPanel(props: {
   const [p2pPort, setP2pPort] = useState(8788);
   const [p2pPortLive, setP2pPortLive] = useState(0);
   const [p2pRunning, setP2pRunning] = useState(false);
+  const [downloadMedia, setDownloadMedia] = useState(true);
   const [busyRestart, setBusyRestart] = useState(false);
+  const [renamingDevice, setRenamingDevice] = useState(false);
+  const [deviceNameDraft, setDeviceNameDraft] = useState("");
+  // Local display-name override for a peer (this device only; the peer keeps
+  // advertising its own name to everyone else).
+  const [renamingPeer, setRenamingPeer] = useState<PeerInfo | null>(null);
+  const [peerNameDraft, setPeerNameDraft] = useState("");
+
+  const confirmPeerRename = async () => {
+    const p = renamingPeer;
+    const name = peerNameDraft.trim();
+    setRenamingPeer(null);
+    if (!p || !name) return;
+    try {
+      await api.renamePeer(p.device_id, name);
+      props.onLog?.(`peer now shows as: "${name}" (on this device)`);
+      // the list refreshes through the peers-updated event (rename_peer emits it)
+    } catch (e) {
+      props.onLog?.(`rename peer: error — ${e}`);
+    }
+  };
+
+  const confirmDeviceRename = async () => {
+    const name = deviceNameDraft.trim();
+    setRenamingDevice(false);
+    try {
+      const res = await api.setDeviceName(name);
+      props.onDeviceRenamed?.(res.name);
+      props.onLog?.(
+        `device renamed: "${res.name}" (peers see it from the next launch)`
+      );
+    } catch (e) {
+      props.onLog?.(`rename device: error — ${e}`);
+    }
+  };
   const [bgSync, setBgSync] = useState(
     localStorage.getItem("sn.bgSync") !== "0"
   );
@@ -176,6 +291,7 @@ export function PeersPanel(props: {
         setP2pPort(s.p2p_port_setting);
         setP2pPortLive(s.p2p_port);
         setP2pRunning(s.p2p_running);
+        setDownloadMedia(s.download_media);
       })
       .catch(() => {});
     return () => {
@@ -310,7 +426,7 @@ export function PeersPanel(props: {
   };
 
   return (
-    <aside className="panel">
+    <aside className="panel" ref={panelRef}>
       {props.onClose && (
         <button className="close-panel" title="Close" onClick={props.onClose}>
           <CloseIcon />
@@ -318,7 +434,19 @@ export function PeersPanel(props: {
       )}
       <h2>My device</h2>
       <div className="pad selfdev">
-        <div className="peer-name">{props.deviceName}</div>
+        <div className="selfdev-name">
+          <div className="peer-name">{props.deviceName}</div>
+          <button
+            className="icon-btn"
+            title="Rename device"
+            onClick={() => {
+              setDeviceNameDraft(props.deviceName);
+              setRenamingDevice(true);
+            }}
+          >
+            <PencilIcon size={14} />
+          </button>
+        </div>
         <div className="muted small" title={props.deviceId}>
           <IdChip id={props.deviceId} />
         </div>
@@ -364,6 +492,16 @@ export function PeersPanel(props: {
               <div className="peer-meta">
                 <div className="peer-name">
                   {p.name}{" "}
+                  <button
+                    className="icon-btn"
+                    title="Rename (on this device)"
+                    onClick={() => {
+                      setPeerNameDraft(p.name);
+                      setRenamingPeer(p);
+                    }}
+                  >
+                    <PencilIcon size={12} />
+                  </button>{" "}
                   {trusted && <CheckIcon className="trust-badge" size={12} />}{" "}
                   {p.via_server && (
                     <span
@@ -572,20 +710,44 @@ export function PeersPanel(props: {
             onKeyDown={(e) => e.key === "Enter" && applyAutosave()}
           />
         </label>
-        <label className="adv-row">
-          <span>P2P port</span>
-          <input
-            className="inp num"
-            type="number"
-            min={1}
-            max={65535}
-            value={p2pPort}
-            onChange={(e) => setP2pPort(Number(e.target.value))}
-            onBlur={applyPort}
-            onKeyDown={(e) => e.key === "Enter" && applyPort()}
-          />
-        </label>
-        {IS_ANDROID && (
+         <label className="adv-row">
+           <span>P2P port</span>
+           <input
+             className="inp num"
+             type="number"
+             min={1}
+             max={65535}
+             value={p2pPort}
+             onChange={(e) => setP2pPort(Number(e.target.value))}
+             onBlur={applyPort}
+             onKeyDown={(e) => e.key === "Enter" && applyPort()}
+           />
+         </label>
+         <label className="adv-row">
+           <span>Download media</span>
+           <input
+             type="checkbox"
+             checked={downloadMedia}
+             onChange={(e) => {
+               const v = e.target.checked;
+               setDownloadMedia(v);
+               localStorage.setItem("sn.downloadMedia", v ? "1" : "0");
+               api
+                 .setDownloadMedia(v)
+                 .then(() =>
+                   props.onLog?.(
+                     `download media: ${v ? "on" : "off"} (notes still sync)`
+                   )
+                 )
+                 .catch((err) => props.onLog?.(`download media: ${err}`));
+             }}
+           />
+         </label>
+         <div className="muted small">
+           Off = the note text syncs, but attached media files (.assets/) are
+           not stored on this device.
+         </div>
+         {IS_ANDROID && (
           <>
             <label className="adv-row">
               <span>Background sync</span>
@@ -623,12 +785,43 @@ export function PeersPanel(props: {
         >
           Restart P2P
         </button>
-        <div className="muted small" title={`${props.buildSha} · ${props.vaultPath}`}>
-          build {props.buildSha}
+        <div
+          className="muted small"
+          title={`version ${__BUILD_VERSION__}-${PRE_RELEASE} · build ${props.buildSha}`}
+        >
+          {__BUILD_VERSION__}-{PRE_RELEASE} · build {props.buildSha}
         </div>
         <div className="muted small" title={props.vaultPath}>
           vault: {props.vaultPath}
         </div>
+        {props.onChangeVault && (
+          <button onClick={props.onChangeVault}>Change vault…</button>
+        )}
+        {props.assetReport && (
+          <div
+            className="muted small"
+            title={props.assetReport.orphans.join("\n") || "all assets are in use"}
+          >
+            assets: {props.assetReport.files.length} file
+            {props.assetReport.files.length === 1 ? "" : "s"} ·{" "}
+            {formatBytes(props.assetReport.total_bytes)}
+            {props.assetReport.orphans.length > 0 &&
+              ` · ${props.assetReport.orphans.length} unused (${formatBytes(
+                props.assetReport.orphan_bytes,
+              )})`}
+          </div>
+        )}
+        {props.onCleanAssets && (
+          <button
+            className="wide"
+            disabled={
+              !props.assetReport || props.assetReport.orphans.length === 0
+            }
+            onClick={props.onCleanAssets}
+          >
+            Clean up unused assets…
+          </button>
+        )}
       </div>
 
       <h2>Server sync</h2>
@@ -704,6 +897,93 @@ export function PeersPanel(props: {
         ))}
         {!props.log.length && <div className="muted">No events yet</div>}
       </div>
+
+      {renamingDevice && (
+        <Dialog
+          title="Rename device"
+          onClose={() => setRenamingDevice(false)}
+          actions={
+            <>
+              <button onClick={() => setRenamingDevice(false)}>
+                Cancel
+              </button>
+              <button
+                disabled={
+                  !deviceNameDraft.trim() ||
+                  deviceNameDraft.trim() === props.deviceName
+                }
+                onClick={() => void confirmDeviceRename()}
+              >
+                Rename
+              </button>
+            </>
+          }
+        >
+          <div className="muted small">
+            Neighbors see this name in the peer list and when confirming a
+            connection. It takes effect from the next app launch.
+          </div>
+          <input
+            className="inp"
+            value={deviceNameDraft}
+            onChange={(e) => setDeviceNameDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (
+                e.key === "Enter" &&
+                deviceNameDraft.trim() &&
+                deviceNameDraft.trim() !== props.deviceName
+              ) {
+                void confirmDeviceRename();
+              }
+            }}
+            placeholder="device name"
+          />
+        </Dialog>
+      )}
+
+      {renamingPeer && (
+        <Dialog
+          title="Rename peer"
+          onClose={() => setRenamingPeer(null)}
+          actions={
+            <>
+              <button onClick={() => setRenamingPeer(null)}>
+                Cancel
+              </button>
+              <button
+                disabled={
+                  !peerNameDraft.trim() ||
+                  peerNameDraft.trim() === renamingPeer.name
+                }
+                onClick={() => void confirmPeerRename()}
+              >
+                Rename
+              </button>
+            </>
+          }
+        >
+          <div className="muted small">
+            A private label on this device only. The neighbor keeps showing
+            its own name to everyone else — this just makes the list easier
+            to read for you.
+          </div>
+          <input
+            className="inp"
+            value={peerNameDraft}
+            onChange={(e) => setPeerNameDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (
+                e.key === "Enter" &&
+                peerNameDraft.trim() &&
+                peerNameDraft.trim() !== renamingPeer.name
+              ) {
+                void confirmPeerRename();
+              }
+            }}
+            placeholder="peer name"
+          />
+        </Dialog>
+      )}
     </aside>
   );
 }

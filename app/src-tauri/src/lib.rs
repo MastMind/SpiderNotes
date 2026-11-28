@@ -1,4 +1,5 @@
 mod commands;
+mod media_server;
 mod server_sync;
 mod state;
 
@@ -34,13 +35,15 @@ pub fn run() {
                     .unwrap_or_else(|e| panic!("cannot load device identity: {e}"));
                 let trust = spidernotes_core::TrustStore::load_or_create_in(&dir)
                     .unwrap_or_else(|e| panic!("cannot load trust list: {e}"));
+                let peer_names = spidernotes_core::PeerNames::load_or_create_in(&dir)
+                    .unwrap_or_else(|e| panic!("cannot load peer name overrides: {e}"));
                 // Self-heal: an older build listed the device in its own relay
                 // roster, and with two identically-named devices a user could
                 // have trusted their OWN id. Syncing with oneself can never
                 // work — drop it from the allowlist.
                 let _ = trust.remove(&identity.id);
                 let peers_path = dir.join("peers.json");
-                app.manage(AppState::new(identity, trust, peers_path));
+                app.manage(AppState::new(identity, trust, peer_names, peers_path));
             }
             #[cfg(not(mobile))]
             {
@@ -48,12 +51,14 @@ pub fn run() {
                     .unwrap_or_else(|e| panic!("cannot load device identity: {e}"));
                 let trust = spidernotes_core::TrustStore::load_or_create()
                     .unwrap_or_else(|e| panic!("cannot load trust list: {e}"));
+                let peer_names = spidernotes_core::PeerNames::load_or_create()
+                    .unwrap_or_else(|e| panic!("cannot load peer name overrides: {e}"));
                 // Self-heal (same as the mobile branch above).
                 let _ = trust.remove(&identity.id);
                 let peers_path = spidernotes_core::identity::config_dir()
                     .expect("no config dir")
                     .join("peers.json");
-                app.manage(AppState::new(identity, trust, peers_path));
+                app.manage(AppState::new(identity, trust, peer_names, peers_path));
             }
             if let Some(path) = open_path.clone() {
                 let handle = app.handle().clone();
@@ -86,6 +91,8 @@ pub fn run() {
             }
             Ok(())
         })
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(spidernotes_fgservice::init())
         .invoke_handler(tauri::generate_handler![
             commands::open_vault,
@@ -100,16 +107,24 @@ pub fn run() {
             commands::save_note,
             commands::delete_note,
             commands::rename_note,
+            commands::import_media_file,
+            commands::asset_report,
+            commands::delete_assets,
+            commands::create_encrypted_note,
+            commands::unlock_note,
+            commands::lock_note,
             commands::search_notes,
             commands::backlinks,
             commands::all_tags,
             commands::notes_with_tag,
             commands::rescan,
             commands::device_info,
+            commands::set_device_name,
             commands::list_peers,
             commands::list_trusted,
             commands::trust_device,
             commands::untrust_device,
+            commands::rename_peer,
             commands::mdns_refresh,
             commands::sync_with,
             commands::sync_all,
@@ -117,6 +132,7 @@ pub fn run() {
             commands::set_bg_sync,
             commands::set_autosync_secs,
             commands::set_p2p_port_setting,
+            commands::set_download_media,
             commands::restart_p2p,
             commands::set_server_sync,
             commands::server_sync_status,

@@ -2,7 +2,7 @@ use crate::conflict::{Conflict, ConflictStore};
 use crate::frontmatter;
 use crate::hlc::Hlc;
 use crate::index::Index;
-use crate::note::{body_hash, Note, NoteSummary};
+use crate::note::{body_hash, rewrite_title, Note, NoteSummary};
 use crate::{DeviceIdentity, NoteUpdate};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -44,7 +44,67 @@ impl Vault {
         };
         v.scan_and_repair()
             .context("vault scan failed")?;
+        v.migrate_assets_dir();
         Ok(v)
+    }
+
+    /// One-time upgrade: media assets moved from `assets/` into the hidden
+    /// `.assets/` dir. The directory is renamed and every readable markdown
+    /// reference rewritten (`assets/` -> `.assets/`, `./assets/` ->
+    /// `./.assets/`); the index hashes of the rewritten notes are refreshed.
+    /// Encrypted notes and conflict sidecars keep their legacy references —
+    /// the asset scanner treats the two dir names as equivalent, so nothing
+    /// is reported as an orphan.
+    ///
+    /// The rename is skipped (the legacy dir stays visible and the scanner
+    /// keeps covering it) if `.assets/` already exists, or if `assets/`
+    /// holds any `.md` file: those would otherwise leave `walk`'s scan
+    /// (which skips `.assets`) and be silently tombstoned.
+    fn migrate_assets_dir(&mut self) {
+        let old = self.root.join("assets");
+        let new = self.root.join(".assets");
+        if !old.is_dir() || new.exists() || has_md_file(&old) {
+            return;
+        }
+        if std::fs::rename(&old, &new).is_err() {
+            return;
+        }
+        let mut changed = false;
+        if let Ok(files) = walk_md(&self.root) {
+            for f in files {
+                let Ok(raw) = std::fs::read_to_string(&f) else {
+                    continue;
+                };
+                if frontmatter::is_encrypted(&raw) {
+                    continue; // ciphertext is not (and must not be) rewritten
+                }
+                if !raw.contains("(assets/") && !raw.contains("(./assets/") {
+                    continue;
+                }
+                let next = raw
+                    .replace("(./assets/", "(./.assets/")
+                    .replace("(assets/", "(.assets/");
+                if next == raw {
+                    continue;
+                }
+                if std::fs::write(&f, next.as_bytes()).is_err() {
+                    continue;
+                }
+                let Ok(rel) = to_rel_slash(&f, &self.root) else {
+                    continue;
+                };
+                let hash = body_hash(&next);
+                for s in self.index.notes.values_mut() {
+                    if !s.deleted && s.path == rel {
+                        s.hash = hash.clone();
+                    }
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = self.save_index();
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -70,8 +130,87 @@ impl Vault {
         self.notes().into_iter().filter(|n| !n.deleted).collect()
     }
 
+    /// Live notes the UI shows: hidden (dot-prefixed) paths are excluded.
+    /// Sync is unaffected — it enumerates `notes()`, which includes them.
+    pub fn visible_notes(&self) -> Vec<NoteSummary> {
+        self.live_notes()
+            .into_iter()
+            .filter(|n| !is_hidden_path(&n.path))
+            .collect()
+    }
+
     pub fn get(&self, uuid: &Uuid) -> Option<NoteSummary> {
         self.index.notes.get(uuid).cloned()
+    }
+
+    /// Orphan-asset report for the settings panel. `decrypted` is
+    /// (uuid, plaintext) of the encrypted notes the caller could read
+    /// (their keys are held in memory); every other encrypted note counts
+    /// into `encrypted_unchecked`. Conflict sidecars hold peer versions —
+    /// their references count as used too.
+    pub fn asset_report(&self, decrypted: &[(Uuid, String)]) -> crate::assets::AssetReport {
+        let mut bodies: Vec<String> = Vec::new();
+        let mut unchecked = 0usize;
+        for s in self.live_notes() {
+            if s.encrypted {
+                match decrypted.iter().find(|(u, _)| *u == s.uuid) {
+                    Some((_, plain)) => bodies.push(plain.clone()),
+                    None => unchecked += 1,
+                }
+            } else if let Ok(n) = self.read(&s.uuid) {
+                bodies.push(n.content);
+            }
+        }
+        for c in self.conflicts.list() {
+            if let Ok(content) = self.conflicts.read_their(c) {
+                bodies.push(content);
+            }
+        }
+        crate::assets::scan(&self.root, &bodies, unchecked)
+    }
+
+    /// Delete asset files (guarded to `.assets/`, or the legacy `assets/`,
+    /// in the core). Assets are not indexed, so no HLC/index update is
+    /// needed. Returns freed bytes.
+    pub fn delete_assets(&self, paths: &[String]) -> anyhow::Result<u64> {
+        crate::assets::delete(&self.root, paths)
+    }
+
+    /// The media files a note body references that exist in this vault
+    /// (path + hash) — what goes into the summary's `assets` list. Always
+    /// empty for encrypted notes: the references are unknowable inside
+    /// ciphertext, and a stale list would mislead the sync delta.
+    pub fn assets_of(&self, content: &str) -> Vec<crate::note::AssetRef> {
+        if frontmatter::is_encrypted(content) {
+            return Vec::new();
+        }
+        crate::assets::referenced_assets(&self.root, content)
+    }
+
+    /// Store a media file received from a peer (guarded to the asset dirs).
+    pub fn write_asset(&self, rel: &str, data: &[u8]) -> anyhow::Result<()> {
+        crate::assets::write(&self.root, rel, data)
+    }
+
+    /// Recompute a note summary's asset list from the content on disk and
+    /// the files that currently exist. Called after asset files arrived
+    /// from a peer (they are written AFTER apply_update, so the list the
+    /// apply computed is stale until this runs).
+    pub fn refresh_assets(&mut self, uuid: &Uuid) -> Result<()> {
+        let Some(s) = self.index.notes.get(uuid).cloned() else {
+            return Ok(());
+        };
+        if s.deleted {
+            return Ok(());
+        }
+        let Ok(n) = self.read(uuid) else {
+            return Ok(());
+        };
+        let mut s = s;
+        s.assets = self.assets_of(&n.content);
+        self.index.notes.insert(*uuid, s);
+        self.save_index()?;
+        Ok(())
     }
 
     /// Read full note content for a uuid.
@@ -103,10 +242,13 @@ impl Vault {
     pub fn write(&mut self, rel_path: &str, content: &str) -> Result<NoteSummary> {
         let rel = normalize_rel_path(rel_path)?;
         let hlc = self.next_clock();
-        let uuid = self
-            .find_by_path(&rel)
-            .map(|s| s.uuid)
-            .unwrap_or_else(Uuid::new_v4);
+        let existing = self.find_by_path(&rel);
+        // a hidden (dot) note cannot be CREATED, but an existing hidden file
+        // keeps working (it was legal before the rule and stays synced)
+        if existing.is_none() && is_hidden_path(&rel) {
+            bail!("note names cannot start with '.'");
+        }
+        let uuid = existing.map(|s| s.uuid).unwrap_or_else(Uuid::new_v4);
 
         let with_id = frontmatter::ensure_id(content, &uuid.to_string());
         let abs = self.abs_path(&rel);
@@ -126,6 +268,8 @@ impl Vault {
             deleted: false,
             title,
             preview,
+            encrypted: frontmatter::is_encrypted(content),
+            assets: self.assets_of(content),
         };
         self.index.notes.insert(uuid, summary.clone());
         // a local write is the newest state on the path: any other live uuid
@@ -158,6 +302,8 @@ impl Vault {
             deleted: true,
             title: String::new(),
             preview: String::new(),
+            encrypted: s.encrypted,
+            assets: Vec::new(),
         };
         self.index.notes.insert(*uuid, summary.clone());
         // a deleted note has no shared base and no pending conflicts
@@ -170,8 +316,15 @@ impl Vault {
         Ok(summary)
     }
 
-    /// Move/rename a note (uuid preserved).
-    pub fn rename(&mut self, uuid: &Uuid, new_rel_path: &str) -> Result<NoteSummary> {
+    /// Move/rename a note (uuid preserved). With `new_title` the note's
+    /// heading is rewritten to the new name (a move alone leaves the
+    /// content — and the list title — untouched).
+    pub fn rename(
+        &mut self,
+        uuid: &Uuid,
+        new_rel_path: &str,
+        new_title: Option<&str>,
+    ) -> Result<NoteSummary> {
         let s = self
             .index
             .notes
@@ -179,8 +332,25 @@ impl Vault {
             .ok_or_else(|| anyhow::anyhow!("unknown note {uuid}"))?
             .clone();
         let new_rel = normalize_rel_path(new_rel_path)?;
+        if is_hidden_path(&new_rel) {
+            bail!("note names cannot start with '.'");
+        }
         let old_abs = self.abs_path(&s.path);
         let new_abs = self.abs_path(&new_rel);
+        // resolve the title rewrite (and its encrypted-note guard) BEFORE
+        // moving anything, so a rejected rename leaves the vault untouched
+        let title_rewrite: Option<String> =
+            match new_title.map(str::trim).filter(|t| !t.is_empty()) {
+                Some(t) if t != s.title => {
+                    let raw = std::fs::read_to_string(&old_abs)
+                        .with_context(|| format!("read {}", old_abs.display()))?;
+                    if frontmatter::is_encrypted(&raw) {
+                        anyhow::bail!("cannot rename an encrypted note yet");
+                    }
+                    Some(rewrite_title(&raw, t))
+                }
+                _ => None,
+            };
         if let Some(parent) = new_abs.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -188,15 +358,25 @@ impl Vault {
             .with_context(|| format!("rename {} -> {}", old_abs.display(), new_abs.display()))?;
         // the old folder is kept when the move empties it
         let hlc = self.next_clock();
-        // content is unchanged by a move: carry the row fields over
+        let (title, preview, hash, assets) = match &title_rewrite {
+            Some(content) => {
+                std::fs::write(&new_abs, content.as_bytes())
+                    .with_context(|| format!("write {}", new_abs.display()))?;
+                let (title, preview) = crate::note::title_preview(content);
+                (title, preview, body_hash(content), self.assets_of(content))
+            }
+            None => (s.title.clone(), s.preview.clone(), s.hash.clone(), s.assets.clone()),
+        };
         let summary = NoteSummary {
             uuid: *uuid,
             path: new_rel.clone(),
             hlc,
-            hash: s.hash,
+            hash,
             deleted: false,
-            title: s.title,
-            preview: s.preview,
+            title,
+            preview,
+            encrypted: s.encrypted,
+            assets,
         };
         self.index.notes.insert(*uuid, summary.clone());
         // the rename is the newest state on the destination path
@@ -210,6 +390,9 @@ impl Vault {
     /// learns about a folder when a note is moved into it (or created there).
     pub fn create_folder(&mut self, rel_dir: &str) -> Result<String> {
         let rel = normalize_dir_rel_path(rel_dir)?;
+        if rel.split('/').any(is_hidden) {
+            bail!("folder names cannot start with '.'");
+        }
         let abs = self.root.join(&rel);
         std::fs::create_dir_all(&abs)
             .with_context(|| format!("mkdir {}", abs.display()))?;
@@ -223,6 +406,9 @@ impl Vault {
     pub fn rename_folder(&mut self, old_rel: &str, new_rel: &str) -> Result<usize> {
         let old = normalize_dir_rel_path(old_rel)?;
         let new = normalize_dir_rel_path(new_rel)?;
+        if new.split('/').any(is_hidden) {
+            bail!("folder names cannot start with '.'");
+        }
         if old == new {
             bail!("folder already has that name");
         }
@@ -267,6 +453,8 @@ impl Vault {
                     // a folder move does not touch the content
                     title: s.title,
                     preview: s.preview,
+                    encrypted: s.encrypted,
+                    assets: s.assets,
                 },
             );
         }
@@ -315,7 +503,7 @@ impl Vault {
         if q.is_empty() {
             return Vec::new();
         }
-        self.live_notes()
+        self.visible_notes()
             .into_iter()
             .filter(|s| {
                 let abs = self.abs_path(&s.path);
@@ -345,7 +533,8 @@ impl Vault {
     /// Returns `Ok(true)` if the update — or its merged result — became the
     /// path winner.
      pub fn apply_update(&mut self, u: &NoteUpdate, peer_name: &str) -> Result<bool> {
-        // title/preview are filled in below when the content arrives
+        // title/preview/encrypted/assets are filled in below when the content
+        // arrives
         let mut incoming = NoteSummary {
             uuid: u.uuid,
             path: u.path.clone(),
@@ -354,6 +543,8 @@ impl Vault {
             deleted: u.deleted,
             title: String::new(),
             preview: String::new(),
+            encrypted: false,
+            assets: Vec::new(),
         };
         let beats_uuid = crate::merge::remote_should_apply(self.index.notes.get(&u.uuid), &incoming);
         let beats_path = self
@@ -392,6 +583,8 @@ impl Vault {
                         deleted: true,
                         title: String::new(),
                         preview: String::new(),
+                        encrypted: false,
+                        assets: Vec::new(),
                     },
                 );
                 self.save_index()?;
@@ -436,6 +629,11 @@ impl Vault {
                     std::fs::write(&abs, with_id.as_bytes())?;
                     incoming.hash = u.hash.clone().unwrap_or_else(|| body_hash(content));
                     (incoming.title, incoming.preview) = crate::note::title_preview(content);
+                    incoming.encrypted = frontmatter::is_encrypted(content);
+                    // the peer's asset BLOBS are written by the caller AFTER
+                    // this returns, so the list here only covers files that
+                    // already existed locally (refresh_assets fixes the rest)
+                    incoming.assets = self.assets_of(content);
                     self.index.notes.insert(u.uuid, incoming);
                     // both sides now share exactly this version
                     self.write_base(&u.uuid, content)?;
@@ -462,6 +660,8 @@ impl Vault {
                             deleted: false,
                             title,
                             preview,
+                            encrypted: frontmatter::is_encrypted(&m),
+                            assets: self.assets_of(&m),
                         },
                     );
                     // the peer holds its own (line-order-equivalent) merge
@@ -521,6 +721,19 @@ impl Vault {
             // The peer sent back the shared version (stale resend).
             return Ok(MergeOutcome::None);
         }
+        // Encrypted notes: the content is base64 ciphertext. A three-way
+        // LINE merge of it is meaningless (and a "merged" ciphertext would
+        // decrypt to nothing), so diverged encrypted versions never
+        // auto-merge — they always become a conflict the user resolves as
+        // keep-mine / keep-theirs. (The equality checks above still let a
+        // side that didn't change adopt the other's version verbatim.)
+        if frontmatter::is_encrypted(&ours)
+            || frontmatter::is_encrypted(theirs)
+            || frontmatter::is_encrypted(&base)
+        {
+            self.record_conflict(u, &p, theirs, peer_name);
+            return Ok(MergeOutcome::Conflict);
+        }
         match crate::threeway::merge(&base, &ours, theirs) {
             crate::threeway::Merge::Ok(m) => {
                 if m == ours {
@@ -558,6 +771,8 @@ impl Vault {
                 deleted: false,
                 title,
                 preview,
+                encrypted: frontmatter::is_encrypted(merged),
+                assets: self.assets_of(merged),
             },
         );
         self.write_base(&u.uuid, merged)?;
@@ -665,6 +880,8 @@ impl Vault {
                 deleted: false,
                 title,
                 preview,
+                encrypted: frontmatter::is_encrypted(&content),
+                assets: self.assets_of(&content),
             },
         );
         self.reconcile_path(&path)?;
@@ -843,6 +1060,8 @@ impl Vault {
                     deleted: false,
                     title,
                     preview,
+                    encrypted: frontmatter::is_encrypted(&content),
+                    assets: self.assets_of(&content),
                 };
                 self.index.notes.insert(uuid, summary);
                 tracing::info!("indexed new note {}", rel);
@@ -862,6 +1081,8 @@ impl Vault {
                     deleted: false,
                     title,
                     preview,
+                    encrypted: frontmatter::is_encrypted(&content),
+                    assets: self.assets_of(&content),
                 };
                 self.index.notes.insert(existing.uuid, summary);
                 changed = true;
@@ -962,6 +1183,18 @@ enum MergeOutcome {
     Conflict,
 }
 
+/// True for a dot-prefixed path component (`.assets`, `.hidden.md`, …).
+fn is_hidden(comp: &str) -> bool {
+    comp.starts_with('.')
+}
+
+/// A note/folder path with a dot-prefixed component is hidden: it does
+/// not appear in listings or search and cannot be created. Existing hidden
+/// files keep working — they are read, saved, found by uuid and synced.
+pub fn is_hidden_path(rel: &str) -> bool {
+    rel.split('/').any(is_hidden)
+}
+
 /// Normalize a relative path: strip leading `/`, use `/` separators, forbid `..`.
 pub fn normalize_rel_path(p: &str) -> Result<String> {
     let trimmed = p.trim().trim_start_matches('/');
@@ -1010,7 +1243,10 @@ fn walk_dirs(root: &Path, dir: &Path, out: &mut Vec<String>) {
         if !p.is_dir() {
             continue;
         }
-        if p.file_name().map(|n| n == Index::DIR).unwrap_or(false) {
+        // dot-prefixed dirs are hidden from the listings: the reserved
+        // index dir (.spidernotes), the media dir (.assets), and anything
+        // else the user placed there
+        if p.file_name().map(|n| n.to_string_lossy().starts_with('.')).unwrap_or(false) {
             continue;
         }
         if let Ok(rel) = p.strip_prefix(root) {
@@ -1034,7 +1270,10 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for e in std::fs::read_dir(dir)? {
         let e = e?;
         let p = e.path();
-        if p.file_name().map(|n| n == ".spidernotes").unwrap_or(false) {
+        // the index dir and the media dir never hold notes. Other dot
+        // dirs are still walked: hiding them from the index would
+        // tombstone the notes inside on the next scan
+        if p.file_name().map(|n| n == ".spidernotes" || n == ".assets").unwrap_or(false) {
             continue;
         }
         if p.is_dir() {
@@ -1044,6 +1283,28 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether `dir` (recursively) contains any `.md` file. Used to guard the
+/// `assets/` -> `.assets/` migration: a markdown file in there is a real
+/// note, and moving it under the (scan-skipped) `.assets` dir would
+/// tombstone it.
+fn has_md_file(dir: &Path) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if has_md_file(&p) {
+                return true;
+            }
+        } else if p.extension().is_some_and(|x| x == "md") {
+            return true;
+        }
+    }
+    false
 }
 
 fn to_rel_slash(p: &Path, root: &Path) -> Result<String> {
@@ -1175,10 +1436,97 @@ mod tests {
     fn rename_keeps_uuid() {
         let (mut v, _) = mk_vault();
         let s = v.write("a.md", "v1").unwrap();
-        let r = v.rename(&s.uuid, "sub/b.md").unwrap();
+        let r = v.rename(&s.uuid, "sub/b.md", None).unwrap();
         assert_eq!(r.uuid, s.uuid);
         assert_eq!(r.path, "sub/b.md");
         assert!(v.root().join("sub/b.md").exists());
+    }
+
+    #[test]
+    fn rename_with_new_title_updates_content_and_hash() {
+        let (mut v, _) = mk_vault();
+        let s = v.write("a.md", "# Old\nbody text\n").unwrap();
+        let r = v.rename(&s.uuid, "b.md", Some("New")).unwrap();
+        assert_eq!(r.title, "New");
+        assert_ne!(r.hash, s.hash);
+        let raw = std::fs::read_to_string(v.root().join("b.md")).unwrap();
+        assert!(raw.contains("# New\n"));
+        assert!(!raw.contains("# Old"));
+        // a move without a title keeps the content byte-identical
+        let m = v.rename(&r.uuid, "c.md", None).unwrap();
+        assert_eq!(m.title, "New");
+        assert_eq!(m.hash, r.hash);
+    }
+
+    #[test]
+    fn rename_encrypted_rejects_title_change() {
+        let dir = tmpdir();
+        let dev = DeviceIdentity::generate("d").unwrap();
+        let mut v = Vault::open(&dir, dev).unwrap();
+        let encrypted = "---\nspidernotes-id: x\nspidernotes-encrypted: true\n---\nAAAAciphertext\n";
+        std::fs::write(dir.join("enc.md"), encrypted).unwrap();
+        v.scan_and_repair().unwrap();
+        let s = v.find_by_path("enc.md").unwrap();
+        let err = v.rename(&s.uuid, "enc2.md", Some("New")).unwrap_err();
+        assert!(err.to_string().contains("encrypted"), "{}", err);
+        // a plain move of an encrypted note is fine
+        let r = v.rename(&s.uuid, "enc2.md", None).unwrap();
+        assert_eq!(r.path, "enc2.md");
+    }
+
+    #[test]
+    fn encrypted_note_roundtrip_via_vault() {
+        let (mut v, g) = mk_vault();
+        let (file, _key) = crate::crypto::create("# Secret\n\ntop secret", "Secret", "pw")
+            .unwrap();
+        let s = v.write("secret.md", &file).unwrap();
+        assert!(s.encrypted, "summary must flag the note as encrypted");
+        assert_eq!(s.title, "Secret", "title comes from the frontmatter");
+        assert!(s.preview.is_empty(), "no preview for ciphertext");
+        // the on-disk content is ciphertext, not the plaintext
+        let raw = std::fs::read_to_string(g.0.join("secret.md")).unwrap();
+        assert!(!raw.contains("top secret"));
+        assert!(crate::frontmatter::is_encrypted(&raw));
+        // reading back still yields the ciphertext file
+        let n = v.read(&s.uuid).unwrap();
+        assert!(crate::frontmatter::is_encrypted(&n.content));
+    }
+
+    #[test]
+    fn encrypted_diverged_versions_become_conflict_not_merge() {
+        let (mut a, ga) = mk_vault();
+        let (file, _key) = crate::crypto::create("# S\n\nbase", "S", "pw").unwrap();
+        let sa = a.write("s.md", &file).unwrap();
+        a.set_base(&sa.uuid, &file).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let (mut b, _gb) = mk_vault();
+        // b adopts a's version (shares the base), then both diverge
+        b.apply_update(&sa.to_update(Some(file.clone())), "a").unwrap();
+        b.set_base(&sa.uuid, &file).unwrap();
+
+        let fa = crate::crypto::reencrypt(&file, "S", "# S\n\nedit A", &[7; 32]).unwrap();
+        let fb = crate::crypto::reencrypt(&file, "S", "# S\n\nedit B", &[9; 32]).unwrap();
+        a.write("s.md", &fa).unwrap();
+        // b's diverged version arrives: must become a CONFLICT, not a merge
+        let sb = b.write("s.md", &fb).unwrap();
+        let applied = a.apply_update(&sb.to_update(Some(fb.clone())), "b").unwrap();
+        assert!(!applied, "peer's diverged ciphertext must not win/merge");
+        // our version stays live, the peer's is kept as a conflict
+        let live = a.live_notes().into_iter().find(|n| n.path == "s.md").unwrap();
+        assert_eq!(live.uuid, sa.uuid);
+        let conflicts = a.conflicts().into_iter().filter(|c| c.note_uuid == sa.uuid);
+        assert_eq!(conflicts.count(), 1, "exactly one conflict recorded");
+        // resolving "keep theirs" adopts the peer's ciphertext verbatim
+        let cid = a
+            .conflicts()
+            .into_iter()
+            .find(|c| c.note_uuid == sa.uuid)
+            .unwrap()
+            .id;
+        a.resolve_conflict_keep_theirs(&cid).unwrap();
+        let raw = std::fs::read_to_string(ga.0.join("s.md")).unwrap();
+        assert!(crate::frontmatter::is_encrypted(&raw));
+        assert!(a.conflicts().is_empty());
     }
 
     #[test]
@@ -1214,6 +1562,7 @@ mod tests {
             hash: Some("h".into()),
             deleted: false,
             content: Some("# From peer".into()),
+            assets: None,
         };
         assert!(v.apply_update(&u, "peer").unwrap());
         let content = std::fs::read_to_string(g.0.join("from-peer.md")).unwrap();
@@ -1247,6 +1596,50 @@ mod tests {
         assert!(v.create_folder("a//b").is_err());
         assert!(v.create_folder(".spidernotes").is_err());
         assert!(v.create_folder("a/.spidernotes").is_err());
+        // dot-prefixed names are rejected anywhere in the path
+        assert!(v.create_folder(".secret").is_err());
+        assert!(v.create_folder("a/.inner").is_err());
+        assert!(v.write(".hidden.md", "H").is_err());
+        assert!(v.write("a/.hidden.md", "H").is_err());
+    }
+
+    #[test]
+    fn hidden_notes_are_listed_out_but_still_work() {
+        let (mut v, g) = mk_vault();
+        // dot files/folders that EXIST (created before the rule or placed
+        // there by hand) are still indexed and synced, just hidden
+        std::fs::write(g.0.join(".draft.md"), "draft body text\n").unwrap();
+        std::fs::create_dir_all(g.0.join(".archive")).unwrap();
+        std::fs::write(g.0.join(".archive/old.md"), "archived note\n").unwrap();
+        v.scan_and_repair().unwrap();
+        assert_eq!(v.live_notes().len(), 2);
+        assert!(v.visible_notes().is_empty());
+        assert!(v.search("archived").is_empty());
+        assert!(!v
+            .list_folders()
+            .iter()
+            .any(|f| f.split('/').any(|c| c.starts_with('.'))));
+        // creating hidden entries is rejected
+        assert!(v.write(".new.md", "x").is_err());
+        assert!(v.write("vis/.inner.md", "x").is_err());
+        let t = v.write("t.md", "t").unwrap();
+        assert!(v.rename(&t.uuid, ".archive/t.md", None).is_err());
+        assert!(v.rename_folder("vis", ".archive2").is_err());
+        // an existing hidden note can still be saved (autosave) ...
+        let u = v.find_by_path(".draft.md").unwrap().uuid;
+        v.write(".draft.md", "draft body text v2\n").unwrap();
+        assert_eq!(
+            v.get(&u).unwrap().hash,
+            crate::note::body_hash("draft body text v2\n")
+        );
+        // ... and renamed out of the hidden state
+        v.rename(&u, "draft.md", None).unwrap();
+        let vis = v.visible_notes();
+        assert_eq!(vis.len(), 2); // draft.md + t.md
+        assert!(v
+            .visible_notes()
+            .iter()
+            .any(|s| s.path == "t.md"));
     }
 
     #[test]
@@ -1296,7 +1689,7 @@ mod tests {
     fn moving_or_deleting_last_note_keeps_empty_dir() {
         let (mut v, g) = mk_vault();
         let s = v.write("dir/a.md", "A").unwrap();
-        v.rename(&s.uuid, "top.md").unwrap();
+        v.rename(&s.uuid, "top.md", None).unwrap();
         assert!(g.0.join("dir").exists(), "empty folder must stay after a move");
         let t = v.write("dir2/b.md", "B").unwrap();
         v.delete(&t.uuid).unwrap();
@@ -1313,7 +1706,7 @@ mod tests {
         let (mut b, _gb) = mk_vault();
         b.apply_update(&s.to_update(Some("v1".into())), "a").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let m = a.rename(&s.uuid, "dir/x.md").unwrap();
+        let m = a.rename(&s.uuid, "dir/x.md", None).unwrap();
         b.apply_update(&m.to_update(Some("v1".into())), "a").unwrap();
         assert_eq!(b.get(&s.uuid).unwrap().path, "dir/x.md");
         let dir_b = b.root();
@@ -1490,5 +1883,109 @@ mod tests {
         assert!(a.apply_update(&sb.to_update(Some(theirs)), "b").unwrap());
         assert!(a.conflicts().is_empty());
         assert!(std::fs::read_to_string(ga.0.join("n.md")).unwrap().contains("a\nB\nc"));
+    }
+
+    #[test]
+    fn asset_report_and_guarded_delete() {
+        let (mut v, g) = mk_vault();
+        v.write("n.md", "# n\n![p](assets/p.png)\n").unwrap();
+        std::fs::create_dir_all(g.0.join("assets")).unwrap();
+        std::fs::write(g.0.join("assets/p.png"), b"12345").unwrap();
+        std::fs::write(g.0.join("assets/old.png"), b"12").unwrap();
+        // an encrypted note whose plaintext references ONLY the orphan
+        let (file, _key) =
+            crate::crypto::create("# s\n![old](assets/old.png)\n", "s", "pw").unwrap();
+        v.write("s.md", &file).unwrap();
+
+        // locked: the orphan is listed, the encrypted note is unchecked
+        let r = v.asset_report(&[]);
+        assert_eq!(r.files.len(), 2);
+        assert_eq!(r.encrypted_unchecked, 1);
+        assert_eq!(r.orphans, vec!["assets/old.png".to_string()]);
+        assert_eq!(r.orphan_bytes, 2);
+
+        // unlocked: its reference counts, nothing left orphaned
+        let su = v.find_by_path("s.md").unwrap().uuid;
+        let (plain, _key) =
+            crate::crypto::unlock(&v.read(&su).unwrap().content, "pw").unwrap();
+        let r2 = v.asset_report(&[(su, plain)]);
+        assert_eq!(r2.encrypted_unchecked, 0);
+        assert!(r2.orphans.is_empty());
+
+        // deletion frees bytes and is guarded to assets/
+        assert_eq!(v.delete_assets(&["assets/old.png".to_string()]).unwrap(), 2);
+        assert!(!g.0.join("assets/old.png").exists());
+        assert!(v.delete_assets(&["n.md".to_string()]).is_err());
+        assert!(v.delete_assets(&["assets/../n.md".to_string()]).is_err());
+        assert!(g.0.join("n.md").exists());
+    }
+
+    #[test]
+    fn assets_dir_is_migrated_to_hidden_on_open() {
+        let dir = tmpdir();
+        let dev = DeviceIdentity::generate("test-device").unwrap();
+        // the PRE-migration state: a visible assets/ dir, notes that
+        // reference it (both `assets/` and `./assets/` spellings) and an
+        // encrypted note whose ciphertext keeps the legacy reference
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("assets/pic.png"), b"12345").unwrap();
+        std::fs::write(dir.join("assets/deep.mp4"), b"1234567890").unwrap();
+        let id = Uuid::new_v4();
+        std::fs::write(
+            dir.join("n.md"),
+            format!("---\nspidernotes-id: {id}\n---\n\n# n\n![p](assets/pic.png)\n![d](./assets/deep.mp4)\n"),
+        )
+        .unwrap();
+        let (file, _key) =
+            crate::crypto::create("# s\n![p](assets/pic.png)\n", "s", "pw").unwrap();
+        std::fs::write(dir.join("s.md"), &file).unwrap();
+
+        let v = Vault::open(&dir, dev.clone()).unwrap();
+        // the dir moved and the plaintext references were rewritten
+        assert!(dir.join(".assets/pic.png").exists());
+        assert!(dir.join(".assets/deep.mp4").exists());
+        assert!(!dir.join("assets").exists());
+        let content = std::fs::read_to_string(dir.join("n.md")).unwrap();
+        assert!(content.contains("![p](.assets/pic.png)"));
+        assert!(content.contains("![d](./.assets/deep.mp4)"));
+        // the encrypted note is untouched (ciphertext is never rewritten)
+        let raw_s = std::fs::read_to_string(dir.join("s.md")).unwrap();
+        assert!(!raw_s.contains(".assets/"));
+        // the rewritten note's index hash matches the new content
+        assert_eq!(v.get(&id).unwrap().hash, crate::note::body_hash(&content));
+        // the report sees the moved files; the LEGACY reference inside the
+        // still-locked encrypted note counts as a use, so no orphans
+        let r = v.asset_report(&[]);
+        assert_eq!(r.files.len(), 2);
+        assert_eq!(r.encrypted_unchecked, 1);
+        assert!(r.orphans.is_empty(), "legacy refs must count as uses: {:?}", r.orphans);
+        // opening again is a no-op
+        let v2 = Vault::open(&dir, dev).unwrap();
+        assert_eq!(v2.asset_report(&[]).files.len(), 2);
+        assert!(!dir.join("assets").exists());
+    }
+
+    #[test]
+    fn migration_is_skipped_when_assets_holds_a_note() {
+        let dir = tmpdir();
+        let dev = DeviceIdentity::generate("test-device").unwrap();
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("assets/pic.png"), b"12345").unwrap();
+        // a markdown file in the assets dir is a real note: renaming the
+        // dir under the scan-skipped .assets would tombstone it
+        let id = Uuid::new_v4();
+        std::fs::write(
+            dir.join("assets/notes.md"),
+            format!("---\nspidernotes-id: {id}\n---\n\n# in assets\n"),
+        )
+        .unwrap();
+        let v = Vault::open(&dir, dev).unwrap();
+        // the dir was NOT renamed ...
+        assert!(dir.join("assets").exists());
+        assert!(!dir.join(".assets").exists());
+        // ... and the note is still indexed and live
+        assert!(!v.get(&id).unwrap().deleted);
+        // the scanner still covers the legacy dir
+        assert_eq!(v.asset_report(&[]).files.len(), 1);
     }
 }

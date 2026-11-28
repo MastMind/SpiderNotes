@@ -13,6 +13,26 @@ pub struct Note {
     pub deleted: bool,
 }
 
+/// One media file a note's body references: the vault-relative path where
+/// the file lives (`.assets/...`, or the legacy `assets/...`) and the sha256
+/// of its bytes. A peer compares (path, hash) to decide the bytes are
+/// already there — no re-transfer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetRef {
+    pub path: String,
+    pub hash: String,
+}
+
+/// A media file's bytes, attached to a [`NoteUpdate`]: the receiver stores
+/// the file at `path` (guarded to the vault's asset dirs) so the note's
+/// references resolve on this side too.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetBlob {
+    pub path: String,
+    /// base64 of the file bytes.
+    pub b64: String,
+}
+
 /// Lightweight summary used for index + sync deltas.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoteSummary {
@@ -33,6 +53,19 @@ pub struct NoteSummary {
     /// 80 chars); empty when the note has no second line.
     #[serde(default)]
     pub preview: String,
+    /// True when the body on disk is ciphertext (see `crate::crypto`): the
+    /// title then comes from the `spidernotes-title` frontmatter line and
+    /// the preview is always empty (there is no plaintext to preview).
+    #[serde(default)]
+    pub encrypted: bool,
+    /// Media files the body references that exist in THIS vault (path +
+    /// hash). Sync compares the lists: a missing/stale entry is what makes
+    /// the note re-sent with its [`AssetBlob`]s attached. Empty for encrypted
+    /// notes (the body is ciphertext — the references are unknowable) and for
+    /// references whose file is missing locally. `default`: older index
+    /// files / older peers simply have no list yet.
+    #[serde(default)]
+    pub assets: Vec<AssetRef>,
 }
 
 /// Maximum length of the list-row preview (before the ellipsis).
@@ -45,6 +78,14 @@ const PREVIEW_MAX: usize = 80;
 /// non-empty line after the title line, whitespace-collapsed and capped at
 /// `PREVIEW_MAX` chars. Both empty when the note has no body text.
 pub fn title_preview(content: &str) -> (String, String) {
+    // Encrypted notes: the body is base64 ciphertext — the title is the
+    // plaintext `spidernotes-title` metadata, and there is no preview.
+    if crate::frontmatter::is_encrypted(content) {
+        return (
+            crate::crypto::extract_title(content).unwrap_or_default(),
+            String::new(),
+        );
+    }
     let body: Vec<&str> = match crate::frontmatter::frontmatter_bounds(content) {
         Some((_, end)) => content.lines().skip(end).collect(),
         None => content.lines().collect(),
@@ -79,6 +120,43 @@ pub fn title_preview(content: &str) -> (String, String) {
     (title, preview)
 }
 
+/// Rewrite the note's title line to `new_title` (frontmatter untouched):
+/// an existing ATX heading keeps its level and gets the new text; a note
+/// without a heading gets `# new_title` inserted as the first body line.
+/// The result always yields `new_title` from `title_preview`.
+pub fn rewrite_title(content: &str, new_title: &str) -> String {
+    let (fm_lines, body): (Vec<&str>, Vec<&str>) =
+        match crate::frontmatter::frontmatter_bounds(content) {
+            Some((_start, end)) => (
+                content.lines().take(end).collect(),
+                content.lines().skip(end).collect(),
+            ),
+            None => (Vec::new(), content.lines().collect()),
+        };
+    let mut out: Vec<String> = fm_lines.iter().map(|l| l.to_string()).collect();
+    let first_non_empty = body.iter().position(|l| !l.trim().is_empty());
+    let mut body_out: Vec<String> = body.iter().map(|l| l.to_string()).collect();
+    match first_non_empty {
+        Some(i) => {
+            let t = body[i].trim_start();
+            let hashes: usize = t.chars().take_while(|c| *c == '#').count();
+            let is_heading = (1..=6).contains(&hashes)
+                && t[hashes..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c == ' ' || c == '\t');
+            if is_heading {
+                body_out[i] = format!("{} {new_title}", "#".repeat(hashes));
+            } else {
+                body_out.insert(i, format!("# {new_title}"));
+            }
+        }
+        None => body_out.push(format!("# {new_title}")),
+    }
+    out.extend(body_out);
+    out.join("\n") + if content.ends_with('\n') { "\n" } else { "" }
+}
+
 /// Collapse internal whitespace and cap at `PREVIEW_MAX` chars.
 fn collapse(line: &str) -> String {
     let s: String = line
@@ -93,7 +171,8 @@ fn collapse(line: &str) -> String {
     out
 }
 
-/// A sync update: a summary, optionally with full (or encrypted) content.
+/// A sync update: a summary, optionally with full (or encrypted) content
+/// and the media files the receiver is missing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteUpdate {
     pub uuid: Uuid,
@@ -104,6 +183,10 @@ pub struct NoteUpdate {
     /// Plaintext markdown body (P2P channel). `None` for deleted notes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Media files to store alongside the note (`None` = nothing to send).
+    /// `default`: older peers do not understand the field and ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assets: Option<Vec<AssetBlob>>,
 }
 
 impl NoteSummary {
@@ -115,6 +198,7 @@ impl NoteSummary {
             hash: Some(self.hash.clone()),
             deleted: self.deleted,
             content,
+            assets: None,
         }
     }
 }
@@ -167,6 +251,8 @@ mod tests {
             deleted: false,
             title: "t".into(),
             preview: "p".into(),
+            encrypted: false,
+            assets: Vec::new(),
         };
         let u = s.to_update(Some("body".into()));
         let json = serde_json::to_string(&u).unwrap();
@@ -184,6 +270,30 @@ mod tests {
     fn title_preview_without_heading() {
         let c = "first line\n\nsecond line\n";
         assert_eq!(title_preview(c), ("first line".into(), "second line".into()));
+    }
+
+    #[test]
+    fn rewrite_title_replaces_heading_level_kept() {
+        let c = "---\nspidernotes-id: x\n---\n\n## Old title\nbody\n";
+        let out = rewrite_title(c, "New name");
+        assert_eq!(out, "---\nspidernotes-id: x\n---\n\n## New name\nbody\n");
+        assert_eq!(title_preview(&out).0, "New name");
+    }
+
+    #[test]
+    fn rewrite_title_inserts_when_no_heading() {
+        let c = "first line\nsecond line\n";
+        let out = rewrite_title(c, "Added");
+        assert_eq!(title_preview(&out).0, "Added");
+        assert_eq!(out, "# Added\nfirst line\nsecond line\n");
+    }
+
+    #[test]
+    fn rewrite_title_keeps_frontmatter_and_trailing_newline() {
+        let c = "---\nspidernotes-id: x\ntags: [a]\n---\n\n# Old\n";
+        let out = rewrite_title(c, "New");
+        assert!(out.starts_with("---\nspidernotes-id: x\ntags: [a]\n---\n\n# New"));
+        assert!(out.ends_with('\n'));
     }
 
     #[test]

@@ -5,6 +5,29 @@
 /// `spidernotes-id: <uuid>` inside an existing frontmatter block.
 
 pub const ID_KEY: &str = "spidernotes-id";
+/// Frontmatter key marking a note whose body is encrypted at rest.
+pub const ENCRYPTED_KEY: &str = "spidernotes-encrypted";
+
+/// True when the content carries `spidernotes-encrypted: true` in its
+/// frontmatter (the body is ciphertext, not markdown).
+pub fn is_encrypted(content: &str) -> bool {
+    let Some((start, end)) = frontmatter_bounds(content) else {
+        return false;
+    };
+    content
+        .lines()
+        .take(end)
+        .skip(start)
+        .any(|line| {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix(ENCRYPTED_KEY) else {
+                return false;
+            };
+            rest.trim_start()
+                .strip_prefix(':')
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+        })
+}
 
 /// Returns the frontmatter block bounds `(start_line, end_line)` (end exclusive)
 /// if the content starts with a `---` fenced block, otherwise `None`.

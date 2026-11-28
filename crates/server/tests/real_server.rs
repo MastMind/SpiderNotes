@@ -74,7 +74,7 @@ async fn real_server_relays_sync_between_two_clients() {
         let id_a = id_a.clone();
         async move {
             let mut v = vault_a;
-            sync_initiator(stream, &id_a, b_pub, &mut v).await
+            sync_initiator(stream, &id_a, b_pub, &mut v, true).await
         }
     });
 
@@ -93,7 +93,7 @@ async fn real_server_relays_sync_between_two_clients() {
         let id_b = id_b.clone();
         async move {
             let mut v = vault_b;
-            let r = sync_responder(incoming, &id_b, &mut v, &trust_b).await;
+            let r = sync_responder(incoming, &id_b, &mut v, &trust_b, true).await;
             (r, v)
         }
     });

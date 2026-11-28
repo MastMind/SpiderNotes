@@ -15,6 +15,13 @@ export interface NoteSummary {
   title: string;
   /** List-row preview: first line after the title ("" when none). */
   preview: string;
+  /** True when the body on disk is ciphertext: the title comes from the
+   * frontmatter, the preview is empty, and opening/moving/deleting the note
+   * requires its password. */
+  encrypted?: boolean;
+  /** Media files the note references that exist in this vault (path + hash).
+   * Sync uses it to know which .assets/ bytes a peer is still missing. */
+  assets?: { path: string; hash: string }[];
 }
 
 export interface Note {
@@ -50,6 +57,8 @@ export interface P2pSyncReport {
   sent: number;
   applied: number;
   skipped: number;
+  /** Media files stored on this side from the peer (0 when none). */
+  assets?: number;
 }
 
 export interface OpenResult {
@@ -61,6 +70,12 @@ export interface OpenResult {
   peers: PeerInfo[];
   /** Vault folders (relative slash-separated paths), including empty ones. */
   folders: string[];
+  /**
+   * Local media-server port (127.0.0.1), 0 when it is not running.
+   * <video>/<audio> resolve to http://127.0.0.1:<port>/<rel> because
+   * WebKit's media pipeline cannot play large files from asset:/blob:.
+   */
+  media_port: number;
 }
 
 export interface DeviceInfo {
@@ -75,6 +90,8 @@ export interface P2pSettings {
   p2p_running: boolean;
   /** Unix seconds of the last successful sync (null = never). */
   last_sync: number | null;
+  /** Download media files from peers (notes sync regardless). */
+  download_media: boolean;
 }
 
 export interface TrustedDevice {
@@ -100,6 +117,23 @@ export interface Conflict {
   /** Title/preview of the peer's version, for the row. */
   their_title: string;
   their_preview: string;
+}
+
+/** One media file under the vault's hidden .assets/ dir (vault-relative). */
+export interface AssetFile {
+  path: string;
+  size: number;
+}
+
+/** Orphan-asset scan result (the "Storage" section of settings). */
+export interface AssetReport {
+  files: AssetFile[];
+  /** Paths (subset of files) referenced by no readable note / conflict. */
+  orphans: string[];
+  /** Encrypted notes whose content could not be read (no key held). */
+  encrypted_unchecked: number;
+  total_bytes: number;
+  orphan_bytes: number;
 }
 
 export interface Backlink {

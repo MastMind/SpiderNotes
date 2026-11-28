@@ -13,11 +13,19 @@ pub enum Msg {
         device: String,
         name: String,
         hlc: Hlc,
+        /// Capability: this peer understands `NoteUpdate.assets` (media
+        /// files travel attached to the note). `default`: an older peer
+        /// simply has no field, so a new peer never sends blobs to it.
+        #[serde(default)]
+        assets: bool,
     },
     HelloAck {
         device: String,
         name: String,
         hlc: Hlc,
+        /// Same capability, advertised back to the initiator.
+        #[serde(default)]
+        assets: bool,
     },
     Summaries {
         summaries: Vec<NoteSummary>,
@@ -50,12 +58,17 @@ pub fn my_delta(
     mine: &[NoteSummary],
     theirs: &[NoteSummary],
     forced: &[Uuid],
+    asset_delta: bool,
 ) -> Vec<NoteSummary> {
     mine.iter()
         .filter(|m| {
             match theirs.iter().find(|t| t.uuid == m.uuid) {
                 None => true,
-                Some(t) => m.hlc > t.hlc || forced.iter().any(|f| *f == m.uuid),
+                Some(t) => {
+                    m.hlc > t.hlc
+                        || forced.iter().any(|f| *f == m.uuid)
+                        || (asset_delta && !m.deleted && m.assets != t.assets)
+                }
             }
         })
         .cloned()
@@ -77,6 +90,8 @@ mod tests {
             deleted,
             title: String::new(),
             preview: String::new(),
+            encrypted: false,
+            assets: Vec::new(),
         }
     }
 
@@ -86,9 +101,17 @@ mod tests {
             device: "d".into(),
             name: "n".into(),
             hlc: Hlc::from_parts(1, 0, "d".into()),
+            assets: true,
         };
         let back = Msg::decode(&m.encode()).unwrap();
         assert!(matches!(back, Msg::Hello { .. }));
+        // an older peer's Hello has no `assets` field at all: it decodes as false
+        let old = r#"{"t":"Hello","c":{"device":"d","name":"n","hlc":{"ms":1,"counter":0,"device":"d"}}}"#;
+        let back: Msg = serde_json::from_str(old).unwrap();
+        match back {
+            Msg::Hello { assets, .. } => assert!(!assets),
+            _ => panic!("expected Hello"),
+        }
     }
 
     #[test]
@@ -104,6 +127,8 @@ mod tests {
                 deleted: false,
                 title: String::new(),
                 preview: String::new(),
+                encrypted: false,
+                assets: Vec::new(),
             },
             NoteSummary {
                 uuid: u2,
@@ -113,6 +138,8 @@ mod tests {
                 deleted: false,
                 title: String::new(),
                 preview: String::new(),
+                encrypted: false,
+                assets: Vec::new(),
             },
         ];
         let theirs = vec![NoteSummary {
@@ -123,8 +150,10 @@ mod tests {
             deleted: false,
             title: String::new(),
             preview: String::new(),
+            encrypted: false,
+            assets: Vec::new(),
         }];
-        let d = my_delta(&mine, &theirs, &[]);
+        let d = my_delta(&mine, &theirs, &[], false);
         let uuids: Vec<Uuid> = d.iter().map(|s| s.uuid).collect();
         assert_eq!(uuids, vec![u1, u2]);
     }
@@ -134,7 +163,44 @@ mod tests {
         let s1 = sum(100, "peer", false);
         let mine = vec![s1.clone()];
         let theirs = vec![s1];
-        assert!(my_delta(&mine, &theirs, &[]).is_empty());
+        assert!(my_delta(&mine, &theirs, &[], false).is_empty());
+    }
+
+    #[test]
+    fn delta_includes_asset_difference_only() {
+        // same HLC on both sides, but the peer lacks a media file the note
+        // references (it downloaded the note with media disabled): the note
+        // must be re-sent (with its AssetBlobs attached by the caller).
+        let u = Uuid::new_v4();
+        let mine = vec![NoteSummary {
+            uuid: u,
+            path: "a.md".into(),
+            hlc: Hlc::from_parts(50, 0, "me".into()),
+            hash: "h".into(),
+            deleted: false,
+            title: String::new(),
+            preview: String::new(),
+            encrypted: false,
+            assets: vec![spidernotes_core::note::AssetRef {
+                path: ".assets/a.png".into(),
+                hash: "abc".into(),
+            }],
+        }];
+        let theirs = vec![NoteSummary {
+            uuid: u,
+            path: "a.md".into(),
+            hlc: Hlc::from_parts(50, 0, "me".into()),
+            hash: "h".into(),
+            deleted: false,
+            title: String::new(),
+            preview: String::new(),
+            encrypted: false,
+            assets: Vec::new(),
+        }];
+        // without the asset-delta flag (peer cannot receive media) no re-send
+        assert!(my_delta(&mine, &theirs, &[], false).is_empty());
+        let d = my_delta(&mine, &theirs, &[], true);
+        assert_eq!(d.iter().map(|s| s.uuid).collect::<Vec<_>>(), vec![u]);
     }
 
     #[test]
@@ -150,6 +216,8 @@ mod tests {
             deleted: false,
             title: String::new(),
             preview: String::new(),
+            encrypted: false,
+            assets: Vec::new(),
         }];
         let theirs = vec![NoteSummary {
             uuid: u,
@@ -159,9 +227,11 @@ mod tests {
             deleted: false,
             title: String::new(),
             preview: String::new(),
+            encrypted: false,
+            assets: Vec::new(),
         }];
-        assert!(my_delta(&mine, &theirs, &[]).is_empty());
-        let d = my_delta(&mine, &theirs, &[u]);
+        assert!(my_delta(&mine, &theirs, &[], false).is_empty());
+        let d = my_delta(&mine, &theirs, &[u], false);
         assert_eq!(d.iter().map(|s| s.uuid).collect::<Vec<_>>(), vec![u]);
     }
 }

@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 use std::sync::{Arc, Mutex};
-use spidernotes_core::{DeviceIdentity, TrustStore, Vault};
+use spidernotes_core::{DeviceIdentity, PeerNames, TrustStore, Vault};
 use spidernotes_p2p::discovery::PeerInfo;
 use spidernotes_p2p::server_client::ServerHandle;
+use uuid::Uuid;
 
 pub const DEFAULT_P2P_PORT: u16 = 8788;
 /// Default interval of the background auto-sync ("keep alive") loop.
@@ -49,6 +51,13 @@ pub struct AppState {
     /// clone while sync_* kept reading a stale list. TrustStore itself has
     /// interior mutability, so sharing one instance is safe.
     pub trust: Arc<TrustStore>,
+    /// Local display-name overrides for peers (device id -> name). Applied
+    /// in merged_peers(), so the Network list and note rows show the edited
+    /// name even before (or without) the peer advertising it.
+    pub peer_names: Arc<PeerNames>,
+    /// Download media files received from peers (notes always sync; the
+    /// .assets/ bytes travel only when this is on, on BOTH sides).
+    pub download_media: Arc<AtomicBool>,
     /// Auto-sync ("keep alive") interval in seconds, adjustable at runtime.
     pub autosync_secs: Arc<AtomicU64>,
     /// Desired P2P port; applied on (re)start of the P2P listener.
@@ -76,13 +85,50 @@ pub struct AppState {
   pub server_stop: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
   /// Human-readable relay status line for the UI.
   pub server_status: Arc<Mutex<String>>,
+  /// Decryption keys of the encrypted notes currently open in the editor
+  /// (uuid -> key). In memory only: the password is never persisted, and
+  /// the keys are dropped on lock / note close / vault switch / app exit.
+  /// Arc (not a value): AppState is cloned per command, so every clone
+  /// must see the same unlocked set.
+  pub unlocked: Arc<Mutex<HashMap<Uuid, [u8; 32]>>>,
+  /// Local HTTP media server for the current vault (None when not running
+  /// or its start failed). WebKit's media pipeline cannot play large videos
+  /// from the asset: scheme or from blob: URLs, so <video>/<audio> are
+  /// resolved to this loopback server (see media_server.rs).
+  pub media_server: Arc<Mutex<Option<crate::media_server::MediaServer>>>,
 }
 
 impl AppState {
-    pub fn new(identity: DeviceIdentity, trust: TrustStore, peers_path: PathBuf) -> Self {
+   /// Remember the key of an unlocked encrypted note.
+    pub fn unlock_note(&self, uuid: Uuid, key: [u8; 32]) {
+        self.unlocked.lock().unwrap().insert(uuid, key);
+    }
+
+    /// Drop the key of a note (lock it).
+    pub fn lock_note(&self, uuid: &Uuid) {
+        self.unlocked.lock().unwrap().remove(uuid);
+    }
+
+    /// The held key of an unlocked note, if any.
+    pub fn note_key(&self, uuid: &Uuid) -> Option<[u8; 32]> {
+        self.unlocked.lock().unwrap().get(uuid).copied()
+    }
+
+    /// Drop every held key (vault switch / close).
+    pub fn lock_all_notes(&self) {
+        self.unlocked.lock().unwrap().clear();
+    }
+
+    pub fn new(
+        identity: DeviceIdentity,
+        trust: TrustStore,
+        peer_names: PeerNames,
+        peers_path: PathBuf,
+    ) -> Self {
         let (mdns_refresh_tx, _mdns_refresh_rx) = tokio::sync::watch::channel(0u64);
         Self {
             identity,
+            unlocked: Arc::new(Mutex::new(HashMap::new())),
             vault: Arc::new(Mutex::new(None)),
             peers_cache: Arc::new(Mutex::new(load_peers(&peers_path))),
             peers_path: Arc::new(peers_path),
@@ -90,6 +136,9 @@ impl AppState {
             p2p_port: Arc::new(AtomicU16::new(0)),
             sync_gate: Arc::new(tokio::sync::Mutex::new(())),
             trust: Arc::new(trust),
+            peer_names: Arc::new(peer_names),
+            // media sync is on by default; the user can turn it off per device
+            download_media: Arc::new(AtomicBool::new(true)),
             autosync_secs: Arc::new(AtomicU64::new(AUTO_SYNC_INTERVAL_SECS)),
             p2p_port_setting: Arc::new(AtomicU16::new(DEFAULT_P2P_PORT)),
             push_pending: Arc::new(AtomicBool::new(false)),
@@ -102,6 +151,7 @@ impl AppState {
             server_handle: Arc::new(Mutex::new(None)),
             server_stop: Arc::new(Mutex::new(None)),
             server_status: Arc::new(Mutex::new("server sync is off".into())),
+            media_server: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -117,7 +167,12 @@ impl AppState {
             if p.device_id == self.identity.id {
                 continue;
             }
-            map.insert(p.device_id.clone(), p.clone());
+            // a local display-name override wins over the advertised name
+            let mut p = p.clone();
+            if let Some(name) = self.peer_names.name(&p.device_id) {
+                p.name = name;
+            }
+            map.insert(p.device_id.clone(), p);
         }
         map.into_values().collect()
     }

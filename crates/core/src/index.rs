@@ -110,6 +110,8 @@ mod tests {
                 deleted: false,
                 title: "T".into(),
                 preview: "P".into(),
+                encrypted: false,
+                assets: Vec::new(),
             },
         );
         idx.save(&t.0).unwrap();

@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { NoteSummary } from "./types";
-import { WarnIcon } from "./icons";
+import { LockIcon, PencilIcon, TrashIcon, WarnIcon } from "./icons";
 
 interface TreeNode {
   name: string;
@@ -141,6 +141,7 @@ export function NotesTree({
   onDeleteFolder,
   onMoveNote,
   onDeleteNote,
+  onRenameNote,
   onMoveFolder,
   deviceNames,
   conflictCount,
@@ -163,6 +164,7 @@ export function NotesTree({
   onDeleteFolder: (path: string) => void;
   onMoveNote: (uuid: string, destDir: string | null) => void;
   onDeleteNote: (uuid: string) => void;
+  onRenameNote: (uuid: string) => void;
   /** Drag a folder into another one ("" = vault root). */
   onMoveFolder: (oldPath: string, destDir: string) => void;
 }) {
@@ -183,6 +185,92 @@ export function NotesTree({
       window.clearTimeout(lpTimer.current);
       lpTimer.current = null;
     }
+  };
+
+  // Swipe a note row right-to-left: it slides aside to reveal the
+  // rename/delete buttons behind it (Apple Notes style). The transform
+  // is set imperatively (no re-render per move); `swipedUuid` only
+  // tracks the OPEN state (which renders the action layer).
+  const SWIPE_OPEN_PX = 144; // two 72px action buttons
+  const [swipedUuid, setSwipedUuid] = useState<string | null>(null);
+  const swipeEl = useRef<HTMLElement | null>(null);
+  const swipeStart = useRef<{ x: number; y: number } | null>(null);
+  const swipeIntent = useRef(false);
+
+  const closeSwipe = useCallback(() => {
+    const el = swipeEl.current;
+    if (el) {
+      el.style.transition = "transform 150ms ease-out";
+      el.style.transform = "";
+    }
+    swipeEl.current = null;
+    swipeStart.current = null;
+    swipeIntent.current = false;
+    setSwipedUuid(null);
+  }, []);
+
+  useEffect(() => {
+    if (!swipedUuid) return;
+    // a tap anywhere outside the open row and its actions closes it
+    const onDown = (e: Event) => {
+      const t = e.target as Element | null;
+      if (t?.closest?.(".row-actions") || t?.closest?.(".tree-item.swiped"))
+        return;
+      closeSwipe();
+    };
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  }, [swipedUuid, closeSwipe]);
+
+  const onRowTouchStart = (e: React.TouchEvent, n: NoteSummary) => {
+    startLongPress(e, "note", { note: n });
+    const t = e.touches[0];
+    if (!t) return;
+    swipeStart.current = { x: t.clientX, y: t.clientY };
+    swipeIntent.current = false;
+    swipeEl.current = e.currentTarget as HTMLElement;
+  };
+
+  const onRowTouchMove = (e: React.TouchEvent) => {
+    onTouchMoveCancel(e);
+    // while a long-press drag ghost is active, the drag owns the touch
+    if (document.querySelector(".drag-ghost")) return;
+    const s = swipeStart.current;
+    const t = e.touches[0];
+    const el = swipeEl.current;
+    if (!s || !t || !el) return;
+    const dx = t.clientX - s.x;
+    const dy = t.clientY - s.y;
+    if (!swipeIntent.current) {
+      // only a clearly horizontal LEFTWARD drag is a row swipe
+      if (dx > -12 || Math.abs(dx) <= Math.abs(dy)) return;
+      swipeIntent.current = true;
+      clearLpTimer();
+      el.style.transition = "none";
+    }
+    const x = Math.max(-SWIPE_OPEN_PX, Math.min(0, dx));
+    el.style.transform = `translateX(${x}px)`;
+  };
+
+  const onRowTouchEnd = (e: React.TouchEvent, n: NoteSummary) => {
+    onTouchEndCancel();
+    const s = swipeStart.current;
+    const t = e.changedTouches[0];
+    const el = swipeEl.current;
+    if (!s || !el) return;
+    const dx = t ? t.clientX - s.x : 0;
+    if (swipeIntent.current) {
+      el.style.transition = "transform 150ms ease-out";
+      if (dx < -SWIPE_OPEN_PX / 2) {
+        el.style.transform = `translateX(${-SWIPE_OPEN_PX}px)`;
+        setSwipedUuid(n.uuid);
+      } else {
+        el.style.transform = "";
+        closeSwipe();
+      }
+    }
+    swipeStart.current = null;
+    swipeIntent.current = false;
   };
 
   // Right-click anywhere in the notes panel (handled on the sidebar in
@@ -378,13 +466,48 @@ export function NotesTree({
     if (node.note) {
       const n = node.note;
       return (
-        <li key={n.uuid} data-drop-dir={parentDir}>
+        <li key={n.uuid} className="tree-li-note" data-drop-dir={parentDir}>
+          {swipedUuid === n.uuid && (
+            <div className="row-actions">
+              <button
+                className="row-act"
+                title="Rename"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  closeSwipe();
+                  onRenameNote(n.uuid);
+                }}
+              >
+                <PencilIcon />
+              </button>
+              <button
+                className="row-act row-act-danger"
+                title="Delete"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  closeSwipe();
+                  onDeleteNote(n.uuid);
+                }}
+              >
+                <TrashIcon />
+              </button>
+            </div>
+          )}
           <button
-            className={selected === n.uuid ? "tree-item sel" : "tree-item"}
+            className={
+              selected === n.uuid
+                ? "tree-item sel"
+                : "tree-item"
+            }
             title={n.path}
             draggable
             onDragStart={(e) => onDragStart(e, n)}
             onClick={() => {
+              if (swipedUuid === n.uuid) {
+                // a tap on the open row just retracts the actions
+                closeSwipe();
+                return;
+              }
               if (suppressClickRef.current) {
                 suppressClickRef.current = false;
                 return;
@@ -396,11 +519,16 @@ export function NotesTree({
               e.stopPropagation();
               setMenu({ x: e.clientX, y: e.clientY, kind: "note", note: n });
             }}
-            onTouchStart={(e) => startLongPress(e, "note", { note: n })}
-            onTouchMove={onTouchMoveCancel}
-            onTouchEnd={onTouchEndCancel}
+            onTouchStart={(e) => onRowTouchStart(e, n)}
+            onTouchMove={onRowTouchMove}
+            onTouchEnd={(e) => onRowTouchEnd(e, n)}
           >
             <span className="row-top">
+              {n.encrypted ? (
+                <span className="row-lock" title="Encrypted note">
+                  <LockIcon />
+                </span>
+              ) : null}
               <span className="row-title">{n.title || node.name}</span>
               {conflictCount.get(n.uuid) ? (
                 // a span, not a button: the row itself is a button (nested
@@ -524,6 +652,7 @@ export function NotesTree({
           onDeleteFolder={onDeleteFolder}
           onMoveNote={onMoveNote}
           onDeleteNote={onDeleteNote}
+          onRenameNote={onRenameNote}
         />
       )}
     </div>
@@ -548,6 +677,7 @@ function ContextMenu({
   onDeleteFolder,
   onMoveNote,
   onDeleteNote,
+  onRenameNote,
 }: {
   menu: Menu;
   folders: string[];
@@ -558,6 +688,7 @@ function ContextMenu({
   onDeleteFolder: (path: string) => void;
   onMoveNote: (uuid: string, destDir: string | null) => void;
   onDeleteNote: (uuid: string) => void;
+  onRenameNote: (uuid: string) => void;
 }) {
   const x = Math.max(4, Math.min(menu.x, window.innerWidth - 200));
   const y = Math.max(4, Math.min(menu.y, window.innerHeight - 280));
@@ -579,6 +710,7 @@ function ContextMenu({
         run: () => onMenu({ x: menu.x, y: menu.y, kind: "moveTo", note: n }),
       },
       { label: "New folder here", run: () => onNewFolder(parentDir) },
+      { label: "Rename", run: () => onRenameNote(n.uuid) },
       { label: "Delete note", danger: true, run: () => onDeleteNote(n.uuid) },
     ];
   } else if (menu.kind === "moveTo") {

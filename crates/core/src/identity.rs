@@ -197,6 +197,24 @@ mod tests {
     }
 
     #[test]
+    fn save_in_spidernotes_subdir_matches_load() {
+        // Regression: the app renames a device by saving with
+        // `save_in(<base>/spidernotes)` — the SAME dir `load_or_create_in`
+        // reads from. Saving to `<base>` directly (the old mobile bug) wrote a
+        // file startup never read, losing the rename. Verify the roundtrip.
+        let base =
+            std::env::temp_dir().join(format!("sn-identity-path-{}", uuid::Uuid::new_v4()));
+        let a = DeviceIdentity::load_or_create_in("orig", &base).unwrap();
+        let mut renamed = a.clone();
+        renamed.name = "renamed".into();
+        renamed.save_in(&base.join("spidernotes")).unwrap();
+        let c = DeviceIdentity::load_or_create_in("ignored", &base).unwrap();
+        assert_eq!(c.id, a.id, "same identity");
+        assert_eq!(c.name, "renamed", "rename persisted where load reads");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn migrates_double_nested_layout() {
         let base =
             std::env::temp_dir().join(format!("sn-identity-mig-{}", uuid::Uuid::new_v4()));
